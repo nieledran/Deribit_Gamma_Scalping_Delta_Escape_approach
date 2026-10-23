@@ -1,0 +1,443 @@
+#include "ui/action_menu.h"
+#include "ui/dialogs.h"
+#include "ui/format.h"
+#include "ui/window.h"
+#include <QDialogButtonBox>
+#include <QFileDialog>
+#include <QFormLayout>
+#include <QGridLayout>
+#include <QHeaderView>
+#include <QMenu>
+#include <QVBoxLayout>
+namespace scalper
+{
+static QTableWidget* table(const QStringList& labels)
+{
+    auto* t = new QTableWidget;
+    t->setColumnCount(labels.size());
+    t->setHorizontalHeaderLabels(labels);
+    t->verticalHeader()->hide();
+    t->verticalHeader()->setDefaultSectionSize(24);
+    t->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    t->setSelectionBehavior(QAbstractItemView::SelectRows);
+    t->setAlternatingRowColors(true);
+    t->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+    t->horizontalHeader()->setStretchLastSection(true);
+    t->setTextElideMode(Qt::ElideRight);
+    return t;
+}
+void Window::setupUi()
+{
+    resize(960, 540);
+    setMinimumSize(720, 420);
+    setWindowTitle("Deribit Gamma — " + initial.instrument + " — " +
+                   (demo                 ? "Demo"
+                    : initial.production ? "Production"
+                                         : "Testnet"));
+    auto* root = new QWidget;
+    auto* layout = new QVBoxLayout(root);
+    layout->setSpacing(5);
+    setCentralWidget(root);
+    auto* top = new QHBoxLayout;
+    auto* instrument = new QLabel(initial.instrument);
+    instrument->setObjectName("profileInstrument");
+    top->addWidget(instrument);
+    top->addWidget(new QLabel("|"));
+    auto* environment = new QLabel(demo ? "Demo" : initial.production ? "Production" : "Testnet");
+    environment->setObjectName("profileEnvironment");
+    if (initial.production && !demo)
+        environment->setStyleSheet(theme::AlertStyle);
+    top->addWidget(environment);
+    id = new QLineEdit;
+    id->setObjectName("clientId");
+    id->setPlaceholderText("API Client ID");
+    id->setMinimumWidth(100);
+    secret = new QLineEdit;
+    secret->setObjectName("clientSecret");
+    secret->setPlaceholderText("Secret (memory only)");
+    secret->setEchoMode(QLineEdit::Password);
+    secret->setMinimumWidth(120);
+    top->addWidget(id, 1);
+    top->addWidget(secret, 1);
+    status = new QLabel("Disconnected");
+    status->setObjectName("connectionStatus");
+    status->setFixedWidth(fontMetrics().horizontalAdvance("Connection error") + 4);
+    status->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+    connectButton = new QPushButton("Connect");
+    connectButton->setObjectName("connect");
+    top->addWidget(connectButton);
+    top->addWidget(status);
+    layout->addLayout(top);
+    setupDialogs();
+    const int buttonWidth = std::max(100, fontMetrics().horizontalAdvance("Select options") + 20);
+    const int controlHeight = std::max(connectButton->sizeHint().height(), id->sizeHint().height());
+    auto alignButton = [&](QPushButton* button)
+    { button->setFixedSize(buttonWidth, controlHeight); };
+    alignButton(connectButton);
+    id->setFixedHeight(controlHeight);
+    secret->setFixedHeight(controlHeight);
+    connect(connectButton, &QPushButton::clicked, this,
+            [this]
+            {
+                if (!trading)
+                    return;
+                if (id->text().trimmed().isEmpty() || secret->text().isEmpty())
+                {
+                    showInformation(this, "Connect", "Enter the API Client ID and secret.");
+                    return;
+                }
+                auto clientId = id->text().trimmed(), clientSecret = secret->text();
+                secret->clear();
+                QMetaObject::invokeMethod(trading, [w = trading, clientId, clientSecret]
+                                          { w->connectExchange(clientId, clientSecret); });
+            });
+
+    const Config defaults;
+    auto* settings = new QHBoxLayout;
+    auto spin =
+        [&](const QString& label, double maximum, int decimals, double value, const QString& name)
+    {
+        auto* box = new CompactSpinBox;
+        box->setObjectName(name);
+        box->setRange(0, maximum);
+        box->setDecimals(decimals);
+        box->setValue(value);
+        box->setMinimumWidth(75);
+        box->setFixedHeight(controlHeight);
+        box->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+        settings->addWidget(new QLabel(label));
+        settings->addWidget(box, 1);
+        connect(box, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+                [this] { markDirty(); });
+        return box;
+    };
+    band = spin("Delta Change", Limits::MaxDeltaChange, 5, defaults.deltaChange, "deltaChange");
+    band->setToolTip("Change in normalized option delta since the last completed hedge.\n"
+                     "0.50 to 0.54 = 0.04 points. Both straddle legs count in gross quantity.");
+    coverage =
+        spin("Delta coverage (%)", 1000000, 2, defaults.hedgePercent, "hedgePercent");
+    coverage->setMinimum(.01);
+    coverage->setToolTip("Target perpetual = -option delta x coverage / 100. 200% hedges twice the delta.");
+    cooldown = spin("Cooldown (s)", double(Limits::MaxCooldownMs) / 1000, 1,
+                    defaults.cooldownMs / 1000.0, "cooldown");
+    cooldown->setMinimum(.5);
+    auto* advanced = new QPushButton("Advanced");
+    alignButton(advanced);
+    advanced->setObjectName("advanced");
+    settings->addWidget(advanced);
+    layout->addLayout(settings);
+    connect(advanced, &QPushButton::clicked, this,
+            [this]
+            {
+                const auto before = configFromUi();
+                const bool wasDirty = dirty;
+                if (advancedDialog->exec() == QDialog::Accepted)
+                    markDirty();
+                else
+                {
+                    populateConfig(before);
+                    dirty = wasDirty;
+                }
+            });
+
+    auto* controls = new QHBoxLayout;
+    applyButton = new ApplyButton;
+    applyButton->setObjectName("applySettings");
+    startButton = new QPushButton("Start / Resume");
+    startButton->setObjectName("start");
+    stopButton = new QPushButton("Stop & Cancel");
+    stopButton->setObjectName("stop");
+    selectButton = new QPushButton("Select options");
+    selectButton->setObjectName("selectOptions");
+    auto* graph = new QPushButton("Risk graph");
+    graph->setObjectName("riskGraph");
+    connect(graph, &QPushButton::clicked, this, &Window::showRisk);
+    for (auto* button :
+         {static_cast<QPushButton*>(applyButton), startButton, stopButton, selectButton, graph})
+    {
+        alignButton(button);
+        controls->addWidget(button);
+    }
+    auto* detail = new QPushButton("P&&L");
+    detail->setObjectName("pnlDetails");
+    alignButton(detail);
+    controls->addWidget(detail);
+    connect(detail, &QPushButton::clicked, this, &Window::showPnl);
+    auto* actions = new QPushButton("Actions");
+    actions->setObjectName("actions");
+    alignButton(actions);
+    auto* menu = new ActionMenu(actions);
+    menu->setObjectName("actionsMenu");
+    closeAction = menu->addAction("Close hedge");
+    closeAction->setObjectName("closeHedge");
+    closeAction->setProperty("danger", true);
+    auto* exportAction = menu->addAction("Export CSV…");
+    exportAction->setObjectName("exportCsv");
+    menu->addSeparator();
+    deleteAction = menu->addAction("Delete local profile");
+    deleteAction->setObjectName("deleteData");
+    deleteAction->setProperty("danger", true);
+    actions->setMenu(menu);
+    controls->addWidget(actions);
+    controls->addStretch();
+    layout->addLayout(controls);
+    connect(selectButton, &QPushButton::clicked, this, &Window::selectOptions);
+    connect(applyButton, &QPushButton::clicked, this,
+            [this]
+            {
+                if (!trading)
+                    return;
+                auto config = configFromUi();
+                if (auto error = config.validate(); !error.isEmpty())
+                {
+                    showInformation(this, "Settings", error);
+                    return;
+                }
+                QMetaObject::invokeMethod(trading,
+                                          [w = trading, config] { w->applyConfig(config); });
+            });
+    connect(startButton, &QPushButton::clicked, this,
+            [this]
+            {
+                if (trading)
+                    QMetaObject::invokeMethod(trading, &TradingWorker::startTrading);
+            });
+    connect(stopButton, &QPushButton::clicked, this,
+            [this]
+            {
+                if (trading)
+                    QMetaObject::invokeMethod(trading, &TradingWorker::stopTrading);
+            });
+    connect(
+        closeAction, &QAction::triggered, this,
+        [this]
+        {
+            if (trading &&
+                confirmAction(
+                    this, "Close bot hedge",
+                    "Close only the bot's perpetual inventory using the selected execution mode?\n"
+                    "Options remain open. This may increase portfolio delta and margin "
+                    "requirements."))
+                QMetaObject::invokeMethod(trading, &TradingWorker::closeHedge);
+        });
+    connect(exportAction, &QAction::triggered, this,
+            [this]
+            {
+                if (!analytics || demo)
+                    return;
+                auto dir = QFileDialog::getExistingDirectory(this, "Choose CSV export directory");
+                if (!dir.isEmpty())
+                    QMetaObject::invokeMethod(analytics,
+                                              [w = analytics, dir] { w->exportData(dir); });
+            });
+    connect(deleteAction, &QAction::triggered, this,
+            [this]
+            {
+                if (trading &&
+                    confirmAction(this, "Delete local profile data",
+                                  "Cancel this profile's orders, then delete its local settings, "
+                                  "trade history and accumulated P&L?\n"
+                                  "Any exchange position remains open and unmanaged. "
+                                  "A fresh empty profile will be created.\n"
+                                  "Export CSV first if you need the old P&L. "
+                                  "Exchange history and exports remain.",
+                                  true))
+                {
+                    loaded = false;
+                    dirty = false;
+                    QMetaObject::invokeMethod(trading, &TradingWorker::deleteData);
+                }
+            });
+
+    auto* marketPanel = new QFrame;
+    marketPanel->setObjectName("marketPanel");
+    marketPanel->setFrameShape(QFrame::StyledPanel);
+    auto* quotes = new QGridLayout(marketPanel);
+    quotes->setContentsMargins(8, 4, 8, 4);
+    // Fixed column proportions: text changes never resize neighbouring fields.
+    const int quoteWidths[] = {112, 8, 108, 108, 8, 137, 145, 105};
+    for (int col = 0; col < 8; ++col)
+        quotes->setColumnStretch(col, quoteWidths[col]);
+    risk = new StableLabel;
+    risk->setObjectName("riskSummary");
+    quotes->addWidget(risk, 0, 0);
+    quotes->addWidget(new QLabel("|"), 0, 1);
+    bidQuote = new QuoteLabel("Bid", QColor("#319263"));
+    bidQuote->setObjectName("bidQuote");
+    askQuote = new QuoteLabel("Ask", QColor("#c64c55"));
+    askQuote->setObjectName("askQuote");
+    quotes->addWidget(bidQuote, 0, 2);
+    quotes->addWidget(askQuote, 0, 3);
+    quotes->addWidget(new QLabel("|"), 0, 4);
+    netPnl = new StableLabel;
+    netPnl->setText("Net P&L: —");
+    netPnl->setObjectName("netPnl");
+    netPnl->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    quotes->addWidget(netPnl, 0, 5);
+    auto* period = new StableLabel;
+    period->setText("USD eq. | Since first Start");
+    quotes->addWidget(period, 0, 6);
+    pnlCoverage = new StableLabel;
+    pnlCoverage->setObjectName("pnlCoverage");
+    quotes->addWidget(pnlCoverage, 0, 7);
+    layout->addWidget(marketPanel);
+    auto* metrics = new QHBoxLayout;
+    metrics->setSpacing(3);
+    auto group = [&](const char* name)
+    {
+        auto* panel = new QFrame;
+        panel->setFrameShape(QFrame::StyledPanel);
+        panel->setObjectName(name);
+        panel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+        auto* fields = new QGridLayout(panel);
+        fields->setContentsMargins(8, 4, 8, 4);
+        fields->setVerticalSpacing(0);
+        fields->setColumnStretch(0, 1);
+        metrics->addWidget(panel, 1);
+        return fields;
+    };
+    auto* deltaFields = group("deltaPanel");
+    auto* hedgeFields = group("hedgePanel");
+    auto* executionFields = group("executionPanel");
+    auto metric = [&](QGridLayout* fields, int row, const char* name)
+    {
+        auto* value = new StableLabel;
+        value->setObjectName(name);
+        fields->addWidget(value, row, 0);
+        return value;
+    };
+    netDeltaValue = metric(deltaFields, 0, "netDeltaValue");
+    normalizedValue = metric(deltaFields, 1, "normalizedDelta");
+    referenceValue = metric(deltaFields, 2, "referenceDelta");
+    hedgeValue = metric(hedgeFields, 0, "hedgeValue");
+    hedgeUsage = metric(hedgeFields, 1, "hedgeUsage");
+    legsValue = metric(hedgeFields, 2, "legsValue");
+    auto* stateRow = new QGridLayout;
+    stateRow->setColumnStretch(0, 1);
+    stateRow->setColumnStretch(1, 2);
+    estimate = new StableLabel;
+    estimate->setObjectName("hedgeEstimate");
+    executionState = new StableLabel;
+    executionState->setObjectName("executionState");
+    stateRow->addWidget(estimate, 0, 0);
+    stateRow->addWidget(executionState, 0, 1);
+    executionFields->addLayout(stateRow, 0, 0);
+    escapeValue = metric(executionFields, 1, "escapeDelta");
+    activity = metric(executionFields, 2, "tradingActivity");
+    layout->addLayout(metrics);
+    tabs = new QTabWidget;
+    tabs->setObjectName("mainTabs");
+    positions =
+        table({"Instrument", "Qty", "Delta", "Gamma", "Theta", "Vega", "Mark", "Data"});
+    positions->setObjectName("optionPositions");
+    positions->horizontalHeader()->setStretchLastSection(false);
+    positions->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    const int widths[] = {0, 70, 85, 90, 70, 70, 80, 55};
+    for (int col = 1; col < 8; ++col)
+        positions->setColumnWidth(col, widths[col]);
+    positions->horizontalHeaderItem(2)->setToolTip("Position delta (coin)");
+    positions->horizontalHeaderItem(3)->setToolTip("Position gamma (coin per USD)");
+    positions->horizontalHeaderItem(4)->setToolTip(
+        "Position theta (USD, API remaining-lifetime cap)");
+    positions->horizontalHeaderItem(5)->setToolTip("Position vega (USD per volatility point)");
+    positions->setToolTip("Double-click a leg for Greeks and contract details.");
+    tabs->addTab(positions, "Construction");
+    orders = table({"Side", "Price", "Amount", "Filled", "Execution", "State"});
+    orders->setObjectName("hedgeOrders");
+    for (int i = 0; i < 6; ++i)
+        orders->setColumnWidth(i, i == 4 ? 140 : 105);
+    tabs->addTab(orders, "Orders");
+    journal = new QPlainTextEdit;
+    journal->setObjectName("journal");
+    journal->setReadOnly(true);
+    journal->setMaximumBlockCount(Limits::JournalMessages);
+    tabs->addTab(journal, "Journal");
+    layout->addWidget(tabs, 1);
+    connect(tabs, &QTabWidget::currentChanged, this, [this] { render(); });
+    connect(positions, &QTableWidget::cellDoubleClicked, this,
+            [this](int row, int) { showLeg(row); });
+    auto* footer = new QHBoxLayout;
+    auto* connectionPanel = new QFrame;
+    connectionPanel->setObjectName("connectionPanel");
+    connectionPanel->setFrameShape(QFrame::StyledPanel);
+    auto* connection = new QGridLayout(connectionPanel);
+    connection->setContentsMargins(8, 4, 8, 4);
+    const int footerWidths[] = {110, 8, 125, 8, 240};
+    for (int col = 0; col < 5; ++col)
+        connection->setColumnStretch(col, footerWidths[col]);
+    latency = new StableLabel;
+    latency->setText("Latency: — ms");
+    latency->setObjectName("latencyStatus");
+    latency->setToolTip("Exchange request round-trip time; separate from market-data age.");
+    connection->addWidget(latency, 0, 0);
+    connection->addWidget(new QLabel("|"), 0, 1);
+    dataAge = new StableLabel;
+    dataAge->setText("Data age: — ms");
+    dataAge->setObjectName("quoteAge");
+    dataAge->setToolTip("Age of the latest perpetual quote, not network round-trip latency. A "
+                        "small exchange clock lead is tolerated.");
+    connection->addWidget(dataAge, 0, 2);
+    connection->addWidget(new QLabel("|"), 0, 3);
+    clockDifference = new StableLabel;
+    clockDifference->setObjectName("clockDifference");
+    clockDifference->setToolTip("Exchange clock versus PC, estimated by public/get_time. This is a "
+                                "clock difference, not network latency.");
+    connection->addWidget(clockDifference, 0, 4);
+    footer->addWidget(connectionPanel, 3);
+    auto* messagePanel = new QFrame;
+    messagePanel->setObjectName("messagePanel");
+    messagePanel->setFrameShape(QFrame::StyledPanel);
+    auto* message = new QHBoxLayout(messagePanel);
+    message->setContentsMargins(8, 4, 8, 4);
+    quality = new StableLabel;
+    quality->setObjectName("dataQuality");
+    quality->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    message->addWidget(quality);
+    footer->addWidget(messagePanel, 2);
+    layout->addLayout(footer);
+}
+void Window::setupDialogs()
+{
+    advancedDialog = new QDialog(this);
+    advancedDialog->setObjectName("advancedDialog");
+    advancedDialog->setWindowTitle("Advanced settings");
+    advancedDialog->setMinimumWidth(450);
+    auto* advanced = new QFormLayout(advancedDialog);
+    auto add = [&](const QString& title, double min, double max, int decimals, const QString& name)
+    {
+        auto* box = new CompactSpinBox;
+        box->setObjectName(name);
+        box->setRange(min, max);
+        box->setDecimals(decimals);
+        advanced->addRow(title, box);
+        return box;
+    };
+    execution = new QComboBox;
+    execution->setObjectName("executionMode");
+    execution->addItems({executionName(Execution::PostOnly), executionName(Execution::Balanced),
+                         executionName(Execution::Aggressive)});
+    advanced->addRow("Execution:", execution);
+    connect(execution, &QComboBox::currentIndexChanged, this, [this] { markDirty(); });
+    makerWait =
+        add("Maker attempt (s):", .5, double(Limits::MaxMakerWaitMs) / 1000, 1, "makerWait");
+    slippage = add("Slippage limit (bps):", .01, Limits::MaxSlippageBps, 2, "slippage");
+    marginEnabled = new QCheckBox("Stop at account MM usage");
+    marginEnabled->setObjectName("marginLimitEnabled");
+    advanced->addRow(marginEnabled);
+    margin = add("MM / Margin Balance (%):", .01, 99.99, 2, "maxMarginUsage");
+    marginInfo = new QLabel("Account margin data unavailable");
+    marginInfo->setWordWrap(true);
+    advanced->addRow(marginInfo);
+    auto* note =
+        new QLabel("The threshold pauses trading and cancels bot orders; positions remain.\n"
+                   "Reducing the perpetual can increase portfolio margin requirements.\n"
+                   "Changes are saved with Apply in the main window.");
+    note->setWordWrap(true);
+    advanced->addRow(note);
+    auto* done = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    advanced->addRow(done);
+    connect(done, &QDialogButtonBox::accepted, advancedDialog, &QDialog::accept);
+    connect(done, &QDialogButtonBox::rejected, advancedDialog, &QDialog::reject);
+    connect(marginEnabled, &QCheckBox::toggled, margin, &QWidget::setEnabled);
+}
+} // namespace scalper

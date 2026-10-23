@@ -1,6 +1,6 @@
 # Third-party components
 
-Deribit Grid's own code is MIT licensed; see `LICENSE`.
+Deribit Gamma's own code is MIT licensed; see `LICENSE`.
 
 ## Qt 6.8.3
 
@@ -17,12 +17,6 @@ QtWebSockets source archives in `sources/`. These archives also contain upstream
 third-party notices and build instructions. Qt source is available separately at
 [the official 6.8.3 archive](https://download.qt.io/archive/qt/6.8/6.8.3/submodules/).
 See [Qt licensing](https://doc.qt.io/qt-6.8/licensing.html).
-
-## Boost 1.89.0
-
-Boost.Multiprecision supplies checked integer arithmetic as a header-only dependency.
-The Boost Software License is retained in `licenses/Boost-1.89.0.txt` and the ZIP.
-No Boost DLLs are required.
 
 ## Microsoft runtime
 

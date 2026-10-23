@@ -59,14 +59,14 @@ def check_executable(executable):
 
 
 def package(runtime, qt, output):
-    required = ["DeribitGrid.exe", "qt.conf", "Qt6Core.dll", "Qt6Gui.dll", "Qt6Widgets.dll",
+    required = ["DeribitGamma.exe", "qt.conf", "Qt6Core.dll", "Qt6Gui.dll", "Qt6Widgets.dll",
                 "Qt6Network.dll", "Qt6WebSockets.dll", "Qt6Sql.dll", "msvcp140.dll",
                 "vcruntime140.dll", "vcruntime140_1.dll", "plugins/platforms/qwindows.dll",
                 "plugins/sqldrivers/qsqlite.dll", "plugins/tls/qschannelbackend.dll"]
     for name in required:
         if not (runtime / name).is_file():
             raise RuntimeError(f"Missing runtime file: {name}; deploy with scripts/build.py first")
-    check_executable(runtime / "DeribitGrid.exe")
+    check_executable(runtime / "DeribitGamma.exe")
     config = (runtime / "qt.conf").read_text(encoding="utf-8")
     if re.search(r"[A-Za-z]:[\\/]|(?:^|=)\s*/", config, re.MULTILINE):
         raise RuntimeError("qt.conf must use relative paths")
@@ -85,7 +85,7 @@ def package(runtime, qt, output):
             raise RuntimeError(f"{dll.name} differs from the Qt installation supplying the sources/SBOM")
 
     # Explicitly select runtime files: never recursively archive the working dist directory.
-    files = {"DeribitGrid.exe": runtime / "DeribitGrid.exe", "qt.conf": runtime / "qt.conf"}
+    files = {"DeribitGamma.exe": runtime / "DeribitGamma.exe", "qt.conf": runtime / "qt.conf"}
     for file in runtime.glob("*.dll"):
         files[file.name] = file
     for folder, suffix in (("plugins", ".dll"), ("translations", ".qm")):
@@ -138,9 +138,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qt", type=Path,
                         default=Path(os.environ.get("QT_ROOT", ROOT / ".deps/Qt/6.8.3/msvc2022_64")))
-    parser.add_argument("--dist", type=Path, default=ROOT / "dist")
+    parser.add_argument("--dist", type=Path, default=ROOT / "gamma-dist")
     parser.add_argument("--output", type=Path,
-                        default=ROOT / "releases/DeribitGrid-0.1.0-windows-x64.zip")
+                        default=ROOT / "releases/DeribitGamma-0.1.0-windows-x64.zip")
     args = parser.parse_args()
     try:
         package(args.dist.resolve(), args.qt.resolve(), args.output.resolve())

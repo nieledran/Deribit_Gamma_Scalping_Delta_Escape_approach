@@ -1,36 +1,44 @@
 #pragma once
-#include "engine/grid.h"
-#include <QJsonObject>
+#include "engine/hedger.h"
+#include <QHash>
 #include <QSqlDatabase>
-#include <QString>
-
-QJsonObject encodeEngine(const grid::Engine& engine, bool records = true);
-grid::Engine decodeEngine(const QJsonObject& object);
-
-class Store {
-public:
+namespace scalper
+{
+QString compact(const QJsonObject& json);
+QJsonObject object(const QString& text);
+void sqlExec(QSqlDatabase db, const QString& statement, const QVariantList& values = {});
+class Store
+{
+  public:
     explicit Store(const QString& path);
     ~Store();
     Store(const Store&) = delete;
     Store& operator=(const Store&) = delete;
-    bool load(grid::Engine& engine);
-    void save(grid::Engine& engine);
-    bool recoverOrder(const std::string& label, grid::Engine& engine);
-    bool ownsExchangeId(const QString& id);
-    void expectFee(const QString& id, grid::Int lots);
-    grid::Int feeValue(const QString& id, bool covered = false);
-    bool recordFee(const QString& key, const QString& id, grid::Int lots);
-    void resetFees();
-    void resetProfile(const grid::Engine& fresh);
-    QStringList missingFees();
-    bool feesComplete();
-    void bindAccount(const QString& identity);
+    QJsonObject metadata(const QString& key) const;
+    void metadata(const QString& key, const QJsonObject& value);
+    QString profileId() const
+    {
+        return id;
+    }
+    void bind(const QString& account);
+    bool load(Hedger& engine, QVector<Order>& orders);
+    void save(const Hedger& engine, const QVector<Order>& orders);
+    void event(const QString& kind, const QJsonObject& data = {}, qint64 at = 0);
+    void fill(const QJsonObject& trade);
+    void fillMany(const QJsonArray& trades);
+    double coveredQuantity(const QString& orderId) const;
+    void resetProfile(const Hedger& fresh, const QString& construction, const QString& account,
+                      double externalPosition);
+    QSqlDatabase database() const
+    {
+        return db;
+    }
 
-private:
+  private:
     QSqlDatabase db;
-    QString connection;
-    QByteArray lastSaved;
-    QJsonObject lastMetadata;
-    const grid::Engine* lastEngine = nullptr;
-    std::uint64_t lastRevision = ~std::uint64_t(0);
+    QString connection, id;
+    QHash<QString, QString> savedOrders;
+    mutable QHash<QString, double> coverageCache;
+    QString savedState;
 };
+} // namespace scalper

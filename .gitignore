@@ -1,4 +1,8 @@
 .deps/
+legacy-archive/
+gamma-profiles/
+gamma-dist/
+exports/
 .vs/
 build/
 out/

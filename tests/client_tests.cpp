@@ -3,9 +3,52 @@
 #include <QWebSocketServer>
 #include <QtTest>
 
-class ClientTests : public QObject {
+class ClientTests : public QObject
+{
     Q_OBJECT
-private slots:
+  private slots:
+
+    void invalidParamsIdentifiesMethodAndParameter()
+    {
+        QWebSocketServer server("Invalid parameters", QWebSocketServer::NonSecureMode);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        Client client;
+        QSignalSpy authenticated(&client, &Client::authenticatedSession);
+        connect(&server, &QWebSocketServer::newConnection, this,
+                [&]
+                {
+                    auto* peer = server.nextPendingConnection();
+                    peer->setParent(&server);
+                    connect(
+                        peer, &QWebSocket::textMessageReceived, this,
+                        [peer](const QString& frame)
+                        {
+                            const auto request = QJsonDocument::fromJson(frame.toUtf8()).object();
+                            QJsonObject reply{{"id", request["id"]}};
+                            if (request["method"] == "private/buy")
+                                reply["error"] = QJsonObject{
+                                    {"code", -32602},
+                                    {"message", "Invalid params"},
+                                    {"data", QJsonObject{{"param", "amount"},
+                                                         {"value", "do-not-log-values"}}}};
+                            else
+                                reply["result"] = QJsonObject{{"expires_in", 3600}};
+                            peer->sendTextMessage(QString::fromUtf8(QJsonDocument(reply).toJson()));
+                        });
+                });
+        client.connectTo("fake", "secret-not-for-logs", false,
+                         QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        QTRY_COMPARE(authenticated.size(), 1);
+        QString error;
+        client.call("private/buy", {{"amount", .0086}},
+                    [&](const RpcResult& result) { error = result.error; });
+        QTRY_VERIFY(!error.isEmpty());
+        QVERIFY(error.contains("private/buy"));
+        QVERIFY(error.contains("-32602"));
+        QVERIFY(error.contains("parameter: amount"));
+        QVERIFY(!error.contains("do-not-log-values"));
+        QVERIFY(!error.contains("secret-not-for-logs"));
+    }
 
     void latencyTracksRepliesSlowWaitAndDisconnect()
     {
@@ -15,44 +58,45 @@ private slots:
         QSignalSpy authenticated(&client, &Client::authenticatedSession);
         QWebSocket* peer = nullptr;
         QJsonValue delayedId;
-        const auto reply = [](QWebSocket* socket, const QJsonValue& id) {
-            socket->sendTextMessage(QString::fromUtf8(QJsonDocument(
-                QJsonObject{{"id", id}, {"result", QJsonObject{{"expires_in", 3600}}}})
+        const auto reply = [](QWebSocket* socket, const QJsonValue& id)
+        {
+            socket->sendTextMessage(QString::fromUtf8(
+                QJsonDocument(
+                    QJsonObject{{"id", id}, {"result", QJsonObject{{"expires_in", 3600}}}})
                     .toJson()));
         };
-        connect(&server, &QWebSocketServer::newConnection, this, [&] {
-            peer = server.nextPendingConnection();
-            peer->setParent(&server);
-            connect(peer, &QWebSocket::textMessageReceived, this, [&](const QString& frame) {
-                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object();
-                if (j["method"] == "read/delayed")
-                    delayedId = j["id"];
-                else if (j["method"] == "read/measured")
-                    QTimer::singleShot(200, peer, [&, id = j["id"]] {
-                        reply(peer, id);
-                    });
-                else
-                    reply(peer, j["id"]);
-            });
-        });
+        connect(&server, &QWebSocketServer::newConnection, this,
+                [&]
+                {
+                    peer = server.nextPendingConnection();
+                    peer->setParent(&server);
+                    connect(peer, &QWebSocket::textMessageReceived, this,
+                            [&](const QString& frame)
+                            {
+                                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object();
+                                if (j["method"] == "read/delayed")
+                                    delayedId = j["id"];
+                                else if (j["method"] == "read/measured")
+                                    QTimer::singleShot(200, peer,
+                                                       [&, id = j["id"]] { reply(peer, id); });
+                                else
+                                    reply(peer, j["id"]);
+                            });
+                });
         using State = Client::ConnectionStatus::State;
         QCOMPARE(client.connectionStatus().state, State::Idle);
-        client.connectTo(
-            "fake", "fake", false, QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        client.connectTo("fake", "fake", false,
+                         QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
         QTRY_COMPARE(authenticated.size(), 1);
         bool measured = false;
-        client.call("read/measured", {}, [&](const RpcResult&) {
-            measured = true;
-        });
+        client.call("read/measured", {}, [&](const RpcResult&) { measured = true; });
         QTRY_VERIFY(measured);
         const auto normal = client.connectionStatus();
         QVERIFY(normal.milliseconds >= 150);
         QVERIFY(normal.milliseconds < 1000);
         QVERIFY(!normal.slow);
         bool delayed = false;
-        client.call("read/delayed", {}, [&](const RpcResult&) {
-            delayed = true;
-        });
+        client.call("read/delayed", {}, [&](const RpcResult&) { delayed = true; });
         QTRY_VERIFY(!delayedId.isUndefined());
         QTRY_VERIFY_WITH_TIMEOUT(client.connectionStatus().slow, 3000);
         QVERIFY(client.connectionStatus().waiting);
@@ -66,9 +110,7 @@ private slots:
         QTRY_VERIFY(delayed);
         QVERIFY(client.connectionStatus().slow);
         bool fast = false;
-        client.call("read/fast", {}, [&](const RpcResult&) {
-            fast = true;
-        });
+        client.call("read/fast", {}, [&](const RpcResult&) { fast = true; });
         QTRY_VERIFY(fast);
         QVERIFY(!client.connectionStatus().slow);
         QVERIFY(client.connectionStatus().milliseconds < 1000);
@@ -86,32 +128,34 @@ private slots:
         QVERIFY(server.listen(QHostAddress::LocalHost, 0));
         Client client;
         QSignalSpy authenticated(&client, &Client::authenticatedSession);
-        connect(&server, &QWebSocketServer::newConnection, this, [&] {
-            auto* peer = server.nextPendingConnection();
-            peer->setParent(&server);
-            connect(peer, &QWebSocket::textMessageReceived, this, [peer](const QString& frame) {
-                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object();
-                peer->sendTextMessage(QString::fromUtf8(QJsonDocument(
-                    QJsonObject{{"id", j["id"]}, {"result", QJsonObject{{"expires_in", 3600}}}})
-                        .toJson()));
-            });
-        });
-        client.connectTo(
-            "fake", "fake", false, QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        connect(&server, &QWebSocketServer::newConnection, this,
+                [&]
+                {
+                    auto* peer = server.nextPendingConnection();
+                    peer->setParent(&server);
+                    connect(peer, &QWebSocket::textMessageReceived, this,
+                            [peer](const QString& frame)
+                            {
+                                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object();
+                                peer->sendTextMessage(QString::fromUtf8(
+                                    QJsonDocument(
+                                        QJsonObject{{"id", j["id"]},
+                                                    {"result", QJsonObject{{"expires_in", 3600}}}})
+                                        .toJson()));
+                            });
+                });
+        client.connectTo("fake", "fake", false,
+                         QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
         QTRY_COMPARE(authenticated.size(), 1);
-        client.setTradingLimits({{"matching_engine",
-            QJsonObject{{"trading", QJsonObject{{"total", QJsonObject{{"rate", 1}}}}}}}});
+        client.setTradingLimits(
+            {{"matching_engine",
+              QJsonObject{{"trading", QJsonObject{{"total", QJsonObject{{"rate", 1}}}}}}}});
         int completed = 0;
         QElapsedTimer wait;
         wait.start();
         for (int i = 0; i < 3; ++i)
-            client.call(
-                "private/buy", {},
-                [&](const RpcResult&) {
-                    ++completed;
-                },
-                true);
-        QTRY_COMPARE_WITH_TIMEOUT(completed, 2, 4000);
+            client.call("private/buy", {}, [&](const RpcResult&) { ++completed; }, true);
+        QTRY_COMPARE_WITH_TIMEOUT(completed, 3, 5000);
         QVERIFY(wait.elapsed() >=
                 1800); // Third request has waited in the local queue, not on the network.
         QVERIFY(!client.connectionStatus().slow);
@@ -139,33 +183,42 @@ private slots:
         elapsed.start();
         int completed = 0;
         bool uncertain = true;
-        connect(&server, &QWebSocketServer::newConnection, this, [&] {
-            auto* peer = server.nextPendingConnection();
-            peer->setParent(&server);
-            connect(peer, &QWebSocket::textMessageReceived, this, [&, peer](const QString& frame) {
-                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object();
-                const auto method = j["method"].toString();
-                QJsonObject response{{"jsonrpc", "2.0"}, {"id", j["id"]}};
-                if (method == "private/buy") {
-                    times.append(elapsed.elapsed());
-                    response["error"] =
-                        QJsonObject{{"code", 10028}, {"message", "too_many_requests"}};
-                } else
-                    response["result"] =
-                        QJsonObject{{"expires_in", 3600}, {"refresh_token", "fake"}};
-                peer->sendTextMessage(QString::fromUtf8(QJsonDocument(response).toJson()));
-            });
-        });
-        client.connectTo(
-            "fake", "secret", false, QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        connect(&server, &QWebSocketServer::newConnection, this,
+                [&]
+                {
+                    auto* peer = server.nextPendingConnection();
+                    peer->setParent(&server);
+                    connect(peer, &QWebSocket::textMessageReceived, this,
+                            [&, peer](const QString& frame)
+                            {
+                                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object();
+                                const auto method = j["method"].toString();
+                                QJsonObject response{{"jsonrpc", "2.0"}, {"id", j["id"]}};
+                                if (method == "private/buy")
+                                {
+                                    times.append(elapsed.elapsed());
+                                    response["error"] = QJsonObject{
+                                        {"code", 10028}, {"message", "too_many_requests"}};
+                                }
+                                else
+                                    response["result"] = QJsonObject{{"expires_in", 3600},
+                                                                     {"refresh_token", "fake"}};
+                                peer->sendTextMessage(
+                                    QString::fromUtf8(QJsonDocument(response).toJson()));
+                            });
+                });
+        client.connectTo("fake", "secret", false,
+                         QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
         QTRY_COMPARE(authenticated.size(), 1);
         const QJsonObject trading{{"trading", QJsonObject{{"total", QJsonObject{{"rate", 5}}}}}};
-        client.setTradingLimits({{"limits_per_currency", perCurrency},
-            {"matching_engine", perCurrency ? QJsonObject{{"usdc", trading}} : trading}});
+        client.setTradingLimits(
+            {{"limits_per_currency", perCurrency},
+             {"matching_engine", perCurrency ? QJsonObject{{"usdc", trading}} : trading}});
         for (int i = 0; i < 3; ++i)
             client.call(
                 "private/buy", {},
-                [&](const RpcResult& r) {
+                [&](const RpcResult& r)
+                {
                     uncertain = r.uncertain;
                     ++completed;
                     QVERIFY(!r.ok);
@@ -184,19 +237,19 @@ private slots:
         QWebSocketServer server("Destruction simulator", QWebSocketServer::NonSecureMode);
         QVERIFY(server.listen(QHostAddress::LocalHost, 0));
         QWebSocket* peer = nullptr;
-        connect(&server, &QWebSocketServer::newConnection, this, [&] {
-            peer = server.nextPendingConnection();
-            peer->setParent(&server);
-        });
+        connect(&server, &QWebSocketServer::newConnection, this,
+                [&]
+                {
+                    peer = server.nextPendingConnection();
+                    peer->setParent(&server);
+                });
         bool callback = false;
         {
             Client client;
             client.connectTo("fake", "fake-secret", false,
-                QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+                             QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
             QTRY_VERIFY(peer);
-            client.call("pending/read", {}, [&](const RpcResult&) {
-                callback = true;
-            });
+            client.call("pending/read", {}, [&](const RpcResult&) { callback = true; });
             // Deliberately destroy without an explicit stop and with a live socket/auth callback.
         }
         QTest::qWait(50);
@@ -214,44 +267,57 @@ private slots:
         QWebSocket* peer = nullptr;
         QList<QJsonObject> requests;
         bool authParametersOK = false;
-        auto reply = [](QWebSocket* socket, qint64 id, const QJsonValue& result) {
+        auto reply = [](QWebSocket* socket, qint64 id, const QJsonValue& result)
+        {
             socket->sendTextMessage(QString::fromUtf8(
                 QJsonDocument(QJsonObject{{"jsonrpc", "2.0"}, {"id", id}, {"result", result}})
                     .toJson(QJsonDocument::Compact)));
         };
-        connect(&server, &QWebSocketServer::newConnection, this, [&] {
-            peer = server.nextPendingConnection();
-            peer->setParent(&server);
-            connect(peer, &QWebSocket::textMessageReceived, this, [&](const QString& frame) {
-                const auto o = QJsonDocument::fromJson(frame.toUtf8()).object();
-                const auto method = o["method"].toString();
-                const qint64 id = o["id"].toInteger();
-                if (method == "public/auth") {
-                    const auto p = o["params"].toObject();
-                    authParametersOK = p["client_id"] == "test-id" &&
-                                       p["client_secret"] == "test-secret" &&
-                                       p["grant_type"] == "client_credentials";
-                    reply(peer, id,
-                        QJsonObject{{"expires_in", 3600}, {"refresh_token", "test-refresh"}});
-                } else if (method == "public/set_heartbeat" || method == "public/test")
-                    reply(peer, id, QJsonObject{{"ok", true}});
-                else
-                    requests.append(o);
-            });
-        });
+        connect(&server, &QWebSocketServer::newConnection, this,
+                [&]
+                {
+                    peer = server.nextPendingConnection();
+                    peer->setParent(&server);
+                    connect(peer, &QWebSocket::textMessageReceived, this,
+                            [&](const QString& frame)
+                            {
+                                const auto o = QJsonDocument::fromJson(frame.toUtf8()).object();
+                                const auto method = o["method"].toString();
+                                const qint64 id = o["id"].toInteger();
+                                if (method == "public/auth")
+                                {
+                                    const auto p = o["params"].toObject();
+                                    authParametersOK = p["client_id"] == "test-id" &&
+                                                       p["client_secret"] == "test-secret" &&
+                                                       p["grant_type"] == "client_credentials";
+                                    reply(peer, id,
+                                          QJsonObject{{"expires_in", 3600},
+                                                      {"refresh_token", "test-refresh"}});
+                                }
+                                else if (method == "public/set_heartbeat" ||
+                                         method == "public/test")
+                                    reply(peer, id, QJsonObject{{"ok", true}});
+                                else
+                                    requests.append(o);
+                            });
+                });
         client.connectTo("test-id", "test-secret", false,
-            QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+                         QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
         QTRY_COMPARE(authenticated.size(), 1);
         QVERIFY(authParametersOK);
         int first = 0, second = 0;
-        const auto a = client.call("read/first", {}, [&](const RpcResult& r) {
-            if (r.ok)
-                first = r.value.toInt();
-        });
-        const auto b = client.call("read/second", {}, [&](const RpcResult& r) {
-            if (r.ok)
-                second = r.value.toInt();
-        });
+        const auto a = client.call("read/first", {},
+                                   [&](const RpcResult& r)
+                                   {
+                                       if (r.ok)
+                                           first = r.value.toInt();
+                                   });
+        const auto b = client.call("read/second", {},
+                                   [&](const RpcResult& r)
+                                   {
+                                       if (r.ok)
+                                           second = r.value.toInt();
+                                   });
         QTRY_COMPARE(requests.size(), 2);
         reply(peer, b, 22);
         reply(peer, a, 11);
@@ -259,15 +325,16 @@ private slots:
         QTRY_COMPARE(second, 22);
         peer->sendTextMessage(QString::fromUtf8(
             QJsonDocument(QJsonObject{{"method", "subscription"},
-                              {"params", QJsonObject{{"channel", "ticker.test.100ms"},
-                                             {"data", QJsonObject{{"price", 1}}}}}})
+                                      {"params", QJsonObject{{"channel", "ticker.test.100ms"},
+                                                             {"data", QJsonObject{{"price", 1}}}}}})
                 .toJson()));
         QTRY_COMPARE(events.size(), 1);
         int calls = 0;
         bool uncertain = false;
         client.call(
             "private/buy", {{"type", "limit"}},
-            [&](const RpcResult& r) {
+            [&](const RpcResult& r)
+            {
                 ++calls;
                 uncertain = r.uncertain;
             },

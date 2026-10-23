@@ -1,62 +1,80 @@
 #pragma once
-#include <QObject>
+#include "config/settings.h"
 #include <QElapsedTimer>
 #include <QJsonObject>
+#include <QObject>
 #include <QTimer>
 #include <QUrl>
 #include <QWebSocket>
+#include <deque>
 #include <functional>
 #include <map>
-#include <deque>
 
-struct RpcResult {
+struct RpcResult
+{
     bool ok = false;
     QJsonValue value;
     QString error;
     bool uncertain = false;
+    int code = 0;
 };
 
-class Client : public QObject {
+class Client : public QObject
+{
     Q_OBJECT
-public:
+  public:
     using Callback = std::function<void(const RpcResult&)>;
     explicit Client(QObject* parent = nullptr);
     ~Client() override;
-    void connectTo(
-        const QString& id, const QString& secret, bool production, const QUrl& testEndpoint = {});
+    void connectTo(const QString& id, const QString& secret, bool production,
+                   const QUrl& testEndpoint = {});
     void stop();
-    qint64 call(
-        const QString& method, const QJsonObject& params, Callback callback, bool mutation = false);
+    qint64 call(const QString& method, const QJsonObject& params, Callback callback,
+                bool mutation = false, bool priority = false,
+                std::function<bool()> beforeSend = {});
+    bool cancelQueued(qint64 requestId);
 
     bool authenticated() const
     {
         return authorized;
     }
 
-    struct ConnectionStatus {
-        enum class State { Idle, Connecting, Online, Offline };
+    struct ConnectionStatus
+    {
+        enum class State
+        {
+            Idle,
+            Connecting,
+            Online,
+            Offline
+        };
         State state = State::Idle;
         qint64 milliseconds = -1;
+        qint64 queueMilliseconds = -1;
         bool waiting = false, slow = false;
     };
 
     ConnectionStatus connectionStatus() const;
     void setTradingLimits(const QJsonObject& limits);
-signals:
+  signals:
     void authenticatedSession(const QJsonObject& auth);
     void lost();
     void notice(const QString& text);
     void subscription(const QString& channel, const QJsonValue& data);
 
-private:
-    static constexpr int MinimumTradingIntervalMs = 500; //limit on how fast to send orders.
-    static constexpr int InitialRetryMs = 1500;
+  private:
+    static constexpr int MinimumTradingIntervalMs = scalper::Exchange::MinimumTradingIntervalMs;
+    static constexpr int InitialRetryMs = scalper::Exchange::InitialRetryMs;
 
-    struct Pending {
+    struct Pending
+    {
         Callback callback;
         qint64 deadline;
         bool mutation;
         qint64 sentAt = -1;
+        std::function<bool()> beforeSend;
+        qint64 queuedAt = 0;
+        QString method;
     };
 
     QWebSocket socket;
@@ -66,9 +84,10 @@ private:
     std::deque<std::pair<qint64, QJsonObject>> outbound;
     QString clientId, clientSecret, refreshToken;
     QUrl endpoint;
-    qint64 sequence = 0, lastMessage = 0, lastSent = -100;
+    qint64 sequence = 0, lastMessage = 0, lastSent = -scalper::Exchange::ReadIntervalMs;
     qint64 lastMutation = -MinimumTradingIntervalMs;
     qint64 lastLatency = -1, connectionStarted = 0;
+    qint64 lastQueueDelay = -1;
     int mutationInterval = MinimumTradingIntervalMs;
     int retryMs = InitialRetryMs;
     bool wanted = false, authorized = false;

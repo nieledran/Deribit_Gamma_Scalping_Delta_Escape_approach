@@ -1,0 +1,6 @@
+#pragma once
+namespace scalper::BuildInfo
+{
+inline constexpr char Name[] = "@PROJECT_NAME@";
+inline constexpr char Version[] = "@PROJECT_VERSION@";
+}
