@@ -2,6 +2,88 @@
 #include <stdexcept>
 namespace scalper
 {
+void TradingWorker::waitForData(const QString& reason)
+{
+    const bool changed = !waitingData || engine.problem != reason;
+    waitingData = true;
+    engine.stop(reason);
+    desiredClose = false;
+    retryAt = utcNow() + Exchange::MinimumTradingIntervalMs;
+    status = requested == RunRequest::None ? "Waiting for data" : "Waiting; auto-resume pending";
+    if (requestId)
+        client->cancelQueued(requestId);
+    if (changed)
+    {
+        const QString quoteState =
+            engine.quote.fresh(utcNow()) ? QString()
+            : engine.quote.at <= 0
+                ? QString(" No valid perpetual quote available.")
+                : QString(" Quote age %1 ms after clock adjustment; bid %2, ask %3.")
+                      .arg(utcNow() - engine.quote.at)
+                      .arg(engine.quote.bid, 0, 'g', 12)
+                      .arg(engine.quote.ask, 0, 'g', 12);
+        log("Temporary pause: " + reason +
+                (requested != RunRequest::None || startPending ? " Automatic resumption pending."
+                                                               : QString()) +
+                quoteState,
+            {{"quote_at", engine.quote.at},
+             {"bid", engine.quote.bid},
+             {"ask", engine.quote.ask},
+             {"exchange_clock_offset_ms", exchangeClockOffsetMs.value_or(0)}});
+    }
+    save();
+    publish();
+}
+bool TradingWorker::acceptRead(const RpcResult& result, const QString& context)
+{
+    if (result.ok)
+        return true;
+    if (!result.retryable())
+    {
+        fail(context + ": " + result.error);
+        return false;
+    }
+    waitForData(context + ": " + result.error);
+    retryAt = utcNow() + Time::SecondMs;
+    if (!synced)
+        client->reconnect(); // Restart an interrupted connection/reconciliation sequence.
+    return false;
+}
+bool TradingWorker::resumeRequested()
+{
+    if (!waitingData || utcNow() < retryAt || !synced || syncing || busy || liveOrder() ||
+        storageFailed || foreignOrders || selectionReview || startPending)
+        return false;
+    const bool closing = requested == RunRequest::Close;
+    const qint64 now = utcNow();
+    if ((!closing && !engine.dataProblem(now).isEmpty()) || (closing && !engine.quote.fresh(now)))
+        return false;
+    if (now - positionAt > Time::MarketDataMaxAgeMs ||
+        std::abs(actualPosition - expectedPosition()) > engine.spec.step * .1)
+    {
+        poll(); // Only recovery needs an extra account refresh, never the normal price loop.
+        return false;
+    }
+    if (requested == RunRequest::Hedge && !engine.start(now))
+    {
+        fail(engine.problem);
+        return false;
+    }
+    if (closing)
+    {
+        engine.running = engine.flattening = true;
+        engine.active = false;
+    }
+    waitingData = false;
+    engine.problem.clear();
+    status = closing ? "Closing hedge" : engine.running ? "Running" : "Paused";
+    attempts = 0;
+    save();
+    log(requested == RunRequest::None ? "Data restored; trading remains paused"
+                                      : "Data and account verified; trading resumed automatically");
+    publish();
+    return engine.running;
+}
 QStringList TradingWorker::marketInstruments(bool onlyStale) const
 {
     const qint64 now = utcNow();
@@ -37,13 +119,14 @@ void TradingWorker::refreshMarketData(QStringList names, std::function<void(bool
         {
             if (generation != epoch)
                 return;
+            if (!acceptRead(result, "Market snapshot unavailable for " + name))
+            {
+                done(false);
+                return;
+            }
             const bool accepted = guard(
                 [&]
                 {
-                    if (!result.ok)
-                        throw std::runtime_error(QString("Market snapshot unavailable for %1: %2")
-                                                     .arg(name, result.error)
-                                                     .toStdString());
                     const auto value = result.value.toObject();
                     if (value["instrument_name"].toString() != name)
                         throw std::runtime_error("Market snapshot instrument mismatch");
@@ -55,30 +138,14 @@ void TradingWorker::refreshMarketData(QStringList names, std::function<void(bool
                             : positions.contains(name) && positions[name].freshGreeks(now);
                     if (!fresh)
                     {
-                        const qint64 age = now - value["timestamp"].toInteger();
-                        QString reason;
-                        if (value["timestamp"].toInteger() <= 0)
-                            reason = "Exchange sent a quote without a valid timestamp for " + name;
-                        else if (age < -Time::MarketClockLeadToleranceMs)
-                            reason = QString("Quote for %1 is %2 ms ahead of PC time. Synchronize "
-                                             "Windows time and reconnect.")
-                                         .arg(name)
-                                         .arg(-age);
-                        else if (age > Time::MarketDataMaxAgeMs)
-                            reason = QString("No fresh prices for %1: last quote is %2 s old. "
-                                             "Trading paused; reconnect if this persists.")
-                                         .arg(name)
-                                         .arg(age / 1000.0, 0, 'f', 1);
-                        else if (name == engine.config.instrument)
-                            reason = "No valid bid/ask for " + name +
-                                     ". Waiting for tradable prices; trading paused.";
-                        else
-                            reason = "Selected option data unavailable for " + name +
-                                     ". Waiting for valid Greeks; trading paused.";
-                        throw std::runtime_error(reason.toStdString());
+                        waitForData("Waiting for fresh, valid market data for " + name);
                     }
                 });
-            if (!accepted)
+            const bool fresh =
+                name == engine.config.instrument
+                    ? engine.quote.fresh(utcNow())
+                    : positions.contains(name) && positions[name].freshGreeks(utcNow());
+            if (!accepted || !fresh)
             {
                 const qint64 sent = utcNow();
                 client->call(
@@ -90,7 +157,15 @@ void TradingWorker::refreshMarketData(QStringList names, std::function<void(bool
                         const qint64 received = utcNow();
                         if (time.ok && time.value.isDouble())
                         {
-                            exchangeClockOffsetMs = time.value.toInteger() - (sent + received) / 2;
+                            const qint64 offset = time.value.toInteger() - (sent + received) / 2;
+                            if (std::abs(offset - exchangeClockOffsetMs.value_or(0)) >
+                                Time::MarketClockLeadToleranceMs / 2)
+                            {
+                                engine.quote.at = 0;
+                                for (auto& option : positions)
+                                    option.tickerAt = 0;
+                            }
+                            exchangeClockOffsetMs = offset;
                             log(QString("Clock check: exchange %1 ms %2 computer (request round "
                                         "trip %3 ms)")
                                     .arg(std::abs(*exchangeClockOffsetMs))
@@ -101,6 +176,8 @@ void TradingWorker::refreshMarketData(QStringList names, std::function<void(bool
                             log("Exchange clock check unavailable");
                     });
                 done(false);
+                if (accepted && !synced)
+                    client->reconnect();
                 return;
             }
             refreshMarketData(std::move(names), std::move(done));
@@ -108,9 +185,13 @@ void TradingWorker::refreshMarketData(QStringList names, std::function<void(bool
 }
 void TradingWorker::refreshQuietMarkets()
 {
-    if (!client || !client->authenticated() || !synced || syncing || refreshingMarket ||
-        startPending)
+    if (!client || !client->authenticated() || !synced || syncing || refreshingMarket)
         return;
+    if (startPending)
+    {
+        startMarketRefresh();
+        return;
+    }
     auto names = marketInstruments(true);
     if (names.isEmpty())
         return;

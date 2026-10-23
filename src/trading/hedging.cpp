@@ -10,6 +10,8 @@ void TradingWorker::finishOperation()
         hedgeElapsed.invalidate();
     }
     engine.complete(utcNow());
+    if (!engine.running)
+        requested = RunRequest::None;
     status = engine.running ? "Running" : "Paused";
     attempts = 0;
     while (orders.size() > Limits::RecentOrders && orders.first().terminal &&
@@ -18,12 +20,15 @@ void TradingWorker::finishOperation()
         orders.removeFirst();
     save();
     log(QString("Hedge target reached: position %1, target %2, remaining %3 %4")
-            .arg(engine.inventory, 0, 'g', 10).arg(engine.operation.target, 0, 'g', 10)
-            .arg(engine.remaining(), 0, 'g', 10).arg(engine.config.base()), {{"inventory", engine.inventory},
-                                     {"execution_ms", lastHedgeMs},
-                                     {"reference_delta", engine.referenceDelta},
-                                     {"target", engine.operation.target},
-                                     {"remaining", engine.remaining()}});
+            .arg(engine.inventory, 0, 'g', 10)
+            .arg(engine.operation.target, 0, 'g', 10)
+            .arg(engine.remaining(), 0, 'g', 10)
+            .arg(engine.config.base()),
+        {{"inventory", engine.inventory},
+         {"execution_ms", lastHedgeMs},
+         {"reference_delta", engine.referenceDelta},
+         {"target", engine.operation.target},
+         {"remaining", engine.remaining()}});
 }
 void TradingWorker::pump()
 {
@@ -34,6 +39,8 @@ void TradingWorker::pump()
         recoverPosition();
         return;
     }
+    if (utcNow() < retryAt)
+        return;
     auto* live = liveOrder();
     if (!synced)
     {
@@ -45,6 +52,14 @@ void TradingWorker::pump()
     }
     if (live && live->uncertain)
         return;
+    if (waitingData)
+    {
+        if (live)
+            cancelOrder(*live);
+        else
+            resumeRequested();
+        return;
+    }
     if (!engine.running)
     {
         if (live)
@@ -63,7 +78,10 @@ void TradingWorker::pump()
                 attempts = 0;
             }
             else
+            {
                 status = "Paused";
+                requested = RunRequest::None;
+            }
         }
         else
             return;
@@ -79,11 +97,21 @@ void TradingWorker::pump()
         auto reason = engine.safety(utcNow());
         if (!reason.isEmpty())
         {
-            fail(reason);
+            if (reason == engine.dataProblem(utcNow()))
+                waitForData(reason);
+            else
+                fail(reason);
             if (live)
                 cancelOrder(*live);
             return;
         }
+    }
+    else if (!engine.quote.fresh(utcNow()))
+    {
+        waitForData("Fresh quote required to close hedge");
+        if (live)
+            cancelOrder(*live);
+        return;
     }
     if (engine.active && engine.obsolete())
     {
@@ -117,7 +145,24 @@ void TradingWorker::pump()
         if (next || previous != engine.completedAt)
             save();
         if (!next)
+        {
+            // Data can expire during the fill-accounting reads above, after the first check.
+            if (!engine.running && !engine.problem.isEmpty() && requested != RunRequest::None)
+            {
+                if (engine.problem == engine.dataProblem(utcNow()) ||
+                    (requested == RunRequest::Close && !engine.quote.fresh(utcNow())))
+                    waitForData(engine.problem);
+                else
+                    fail(engine.problem);
+                return;
+            }
+            if (!engine.running)
+            {
+                requested = RunRequest::None;
+                status = "Paused";
+            }
             return;
+        }
         hedgeElapsed.start();
         log("Delta escape", {{"option_delta", next->delta},
                              {"normalized_delta", next->normalized},

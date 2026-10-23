@@ -96,7 +96,7 @@ Config Config::fromJson(const QJsonObject& j)
     c.makerWaitMs = j["maker_wait_ms"].toInt(c.makerWaitMs);
     // Old profiles migrate once to ordinary limit execution.
     int m = j.contains("hedge_percent") ? j["execution"].toInt(int(c.execution))
-                                         : int(Execution::Balanced);
+                                        : int(Execution::Balanced);
     if (m < int(Execution::PostOnly) || m > int(Execution::Aggressive))
         throw std::runtime_error("Invalid saved execution mode");
     c.execution = Execution(m);

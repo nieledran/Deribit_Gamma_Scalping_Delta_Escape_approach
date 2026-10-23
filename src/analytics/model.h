@@ -6,6 +6,12 @@ struct ModelValue
 {
     double usd = 0, delta = 0;
 };
+struct MoveEstimates
+{
+    std::optional<double> rebalancePercent, breakEven;
+};
+// Local, constant-Greek estimates; theta uses the supplied API horizon.
+MoveEstimates estimateMoves(const Greeks& greeks, double price, double deltaChange);
 ModelValue optionModel(const Option& option, double scenarioIndex, qint64 now);
 Greeks modelGreeks(const Option& option, double scenarioIndex, qint64 now);
 QVector<ProfilePoint> portfolioCurve(const QVector<Option>& options, double hedge,

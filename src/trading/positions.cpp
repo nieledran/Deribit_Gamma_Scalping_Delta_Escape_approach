@@ -18,8 +18,11 @@ void TradingWorker::loadPositions(std::function<void()> done, bool reconcileRead
                     {
                         if (generation != epoch)
                             return;
-                        if (!r.ok)
-                            throw std::runtime_error(r.error.toStdString());
+                        if (!acceptRead(r, "Read option positions"))
+                        {
+                            polling = false;
+                            return;
+                        }
                         QSet<QString> seen;
                         QStringList metadata;
                         if (!r.value.isArray())
@@ -92,9 +95,11 @@ void TradingWorker::loadPositions(std::function<void()> done, bool reconcileRead
                                                 {
                                                     if (generation != epoch)
                                                         return;
-                                                    if (!p.ok)
-                                                        throw std::runtime_error(
-                                                            p.error.toStdString());
+                                                    if (!acceptRead(p, "Read perpetual position"))
+                                                    {
+                                                        polling = false;
+                                                        return;
+                                                    }
                                                     auto j = p.value.toObject();
                                                     actualPosition = number(j, "size_currency");
                                                     if (j["direction"] == "sell")
@@ -102,6 +107,17 @@ void TradingWorker::loadPositions(std::function<void()> done, bool reconcileRead
                                                     else if (j["direction"] == "buy")
                                                         actualPosition = std::abs(actualPosition);
                                                     positionAt = utcNow();
+                                                    if (std::abs(actualPosition -
+                                                                 expectedPosition()) >
+                                                        engine.spec.step * .1)
+                                                        store->event(
+                                                            "position_mismatch_snapshot",
+                                                            {{"position", j},
+                                                             {"expected_position",
+                                                              expectedPosition()},
+                                                             {"inventory", engine.inventory},
+                                                             {"external_position",
+                                                              externalPosition}});
                                                     liquidation =
                                                         j["estimated_liquidation_price"].toDouble();
                                                     fundingValid = j["realized_funding"].isDouble();
@@ -131,9 +147,11 @@ void TradingWorker::loadPositions(std::function<void()> done, bool reconcileRead
                                                             baseline["session"].toInteger();
                                                     }
                                                     if (synced && before == positionRevision &&
-                                                        std::abs(actualPosition - expectedPosition()) >
+                                                        std::abs(actualPosition -
+                                                                 expectedPosition()) >
                                                             engine.spec.step * .1)
-                                                        requestRecovery("Position snapshot differs from known fills");
+                                                        requestRecovery("Position snapshot differs "
+                                                                        "from known fills");
                                                     save();
                                                     done();
                                                 }))
@@ -147,18 +165,29 @@ void TradingWorker::loadPositions(std::function<void()> done, bool reconcileRead
 }
 void TradingWorker::ticker(const QJsonObject& j)
 {
+    auto available = [](const QJsonObject& value, const char* key)
+    { return value[key].isDouble() && std::isfinite(value[key].toDouble()); };
     QString name = j["instrument_name"].toString();
-    qint64 at = j["timestamp"].toInteger();
+    const qint64 rawTime = j["timestamp"].toInteger();
+    qint64 at = rawTime - exchangeClockOffsetMs.value_or(0);
     qint64 now = utcNow();
-    if (at <= 0 || std::abs(now - at) > Time::TickerTimestampToleranceMs)
+    if (rawTime <= 0 || at <= 0 || std::abs(now - at) > Time::TickerTimestampToleranceMs)
         return;
     if (name == engine.config.instrument)
     {
         if (at < engine.quote.at)
             return;
+        if (!available(j, "best_bid_price") || !available(j, "best_ask_price"))
+        {
+            engine.quote.at = 0;
+            return;
+        }
         double bid = number(j, "best_bid_price"), ask = number(j, "best_ask_price");
         if (bid <= 0 || ask < bid)
+        {
+            engine.quote.at = 0;
             return;
+        }
         engine.quote = {bid, ask, j["mark_price"].toDouble((bid + ask) / 2),
                         j["index_price"].toDouble(), at};
         return;
@@ -166,10 +195,21 @@ void TradingWorker::ticker(const QJsonObject& j)
     auto it = positions.find(name);
     if (it == positions.end())
         return;
-    auto& o = it.value();
+    auto o = it.value();
     if (at < o.tickerAt)
         return;
     auto g = j["greeks"].toObject();
+    bool complete = true;
+    for (const char* key : {"delta", "gamma", "theta", "vega"})
+        complete &= available(g, key);
+    for (const char* key : {"mark_price", "index_price", "underlying_price", "mark_iv"})
+        complete &= available(j, key);
+    if (!complete)
+    {
+        it->hasGreeks = false;
+        updateSelected();
+        return;
+    }
     o.delta = number(g, "delta");
     o.gamma = number(g, "gamma");
     o.theta = number(g, "theta");
@@ -181,9 +221,14 @@ void TradingWorker::ticker(const QJsonObject& j)
     o.rate = j["interest_rate"].toDouble();
     if (o.mark < 0 || o.index <= 0 || o.underlying <= 0 || o.iv < 0 ||
         std::abs(o.delta) > 1.000001 || o.gamma < 0 || o.vega < 0)
-        throw std::runtime_error("Invalid option mark or per-unit Greeks");
+    {
+        it->hasGreeks = false;
+        updateSelected();
+        return;
+    }
     o.tickerAt = at;
     o.hasGreeks = true;
+    it.value() = o;
     updateSelected();
 }
 void TradingWorker::updateSelected()

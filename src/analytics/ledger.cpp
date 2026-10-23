@@ -681,10 +681,20 @@ AnalyticsSnapshot Ledger::report(const TradingSnapshot& s)
     a.pnl = current.pnl - start.pnl;
     a.ready = true;
     a.complete = current.complete && start.complete;
+    if (metadata("pnl_sample/" + s.constructionId).isEmpty())
+    {
+        auto zero = start.pnl.json();
+        zero["construction_pnl"] = Pnl{}.json();
+        zero["started_at"] = a.startedAt;
+        sqlExec(
+            db, "INSERT OR IGNORE INTO samples VALUES(?,?,?,?,?)",
+            {a.startedAt, s.constructionId, compact(baseline), compact(zero), int(start.complete)});
+        metadata("pnl_sample/" + s.constructionId, {{"at", a.startedAt}});
+    }
     QStringList missing = current.missing + start.missing;
     missing.removeDuplicates();
-    a.completeness = a.complete ? "Reconciled P&L since " + isoUtc(a.startedAt)
-                                : missing.join("; ");
+    a.completeness =
+        a.complete ? "Reconciled P&L since " + isoUtc(a.startedAt) : missing.join("; ");
     return a;
 }
 void Ledger::clear()

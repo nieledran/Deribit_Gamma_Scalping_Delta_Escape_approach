@@ -1,102 +1,82 @@
-# Deribit Gamma Scalper v1
+# Deribit Gamma Scalper
 
-A Windows x64 C++20 / Qt 6 desktop application that delta-hedges **selected existing BTC or ETH option positions** with their **USDC perpetual**. Options are read-only. There is no grid, option order entry, multiplier, price trigger, preplaced hedge, or automatic option roll.
+Windows x64 C++20 / Qt 6 application that hedges selected existing BTC or ETH options with the corresponding USDC perpetual. Options are read-only.
 
 ## Run
 
-Build with `python scripts/build.py`, then double-click `start.cmd`. The application is `gamma-dist/DeribitGamma.exe`. Select `BTC_USDC-PERPETUAL` or `ETH_USDC-PERPETUAL` and Testnet/Production in the opening dialog. Each pair has its own profile in `gamma-profiles/` beside the executable. The old grid databases and executable are incompatible and are not loaded.
+Build and test with `python scripts/build.py`, then run `start.cmd`. Profiles live in `gamma-dist/gamma-profiles/`, separately for each instrument and environment. The application starts paused.
 
-1. Enter the matching environment's API Client ID and secret in the top row, then click **Connect**. Credentials are memory-only; the secret field clears after connecting. Use a key with account/trade read permissions and trading permission for the perpetual. A second read-only history connection uses the same credentials; secrets are never saved or exported.
-2. Open **Select options**, filter existing positions by expiry or Call/Put, and choose the legs. Save the draft with **Apply** in the main window. Both coin-settled and USDC-settled options for the chosen asset are supported. The first use requires a flat perpetual and no foreign orders. Close the bot hedge before changing the basket. Other positions are excluded from construction P&L but still affect account margin.
-3. Set a positive **Max hedge ($)**, **Delta Change**, **Cooldown (s)**, and execution policy; click **Apply**, then **Start / Resume**. Maker wait, slippage and an optional account MM stop are under **Advanced**. New profiles have the user MM stop disabled; old positive thresholds remain enabled when migrated.
-4. Watch **Net P&L** in the price row (since inception, including fees and funding) and remaining net delta. **P&L** opens the three reporting periods and breakdown. Incomplete history is labelled; unavailable valuation is a dash. **Hedge P&L is the contribution of the perpetual, not a measurement of pure gamma profit.**
+1. Connect with the matching environment's API key. Credentials stay in memory.
+2. Select existing option positions and click Apply.
+3. Set **Delta coverage (%)**, **Delta Change**, and **Cooldown (s)**. Click Start / Resume.
+4. Execution policy, passive wait, slippage and the optional margin stop are under **Advanced**.
 
-The program always starts paused. A reconnect reconciles durable orders/fills/positions and returns to paused. Review and explicitly resume. Unresolved exchange outcomes block further orders; reconnect to look up the original label instead of sending a duplicate. A separate process lock prevents two gamma profiles owning the same account/environment/perpetual on this computer.
+The first successful Start durably records the construction's initial valuation before submitting any hedge order. Stop/Resume, reconnect, restart, changing coverage and Close hedge preserve this P&L start. Changing the option basket creates a new construction and requires closing the previous hedge first.
 
-Open options lists only nonzero positions whose expiry is still in the future. Closed or expired selected legs remain in the accounting basket for history, settlement and P&L; they are not offered as tradable selections. Account polling discovers replacement positions without reconnecting. A read error stops trading safely but does not permanently disable later position polls.
+## Hedge size and trigger
 
-Start requests fresh perpetual and selected-option snapshots before enabling hedging. Quiet selected markets also receive periodic `public/ticker` refreshes, so freshness does not depend solely on unsolicited ticker events. Exchange timestamps are checked; stale or invalid snapshots still block trading. Stop cancels a pending Start, including while market-data requests are outstanding.
+`Option delta = sum(signed option quantity x per-unit option delta)`.
 
-The main window starts at 960 x 540 with Qt Fusion controls and a light palette matching Grid Bot. Construction, Orders and Journal share the central area. The construction table includes position Greeks; its narrow Data column shows quote freshness. Double-click a leg for contract details. Bid and ask have short, fading green/red backgrounds on change; larger moves have stronger shading. Production is marked in red. **Actions** contains Close hedge, New Session, Export CSV and Delete local profile. Destructive items are red and show `(Locked)` while disabled; confirmations default to No.
+`Target perpetual = -option delta x coverage / 100`, rounded toward zero to the exchange amount step.
 
-Live fields have separate, stable columns: changing values or status text cannot move adjacent fields. Overlong fields are elided with full text in tooltips. Main buttons have equal dimensions. Unsaved settings are indicated only by subtle moving blue/white stripes on **Apply**; restoring the applied settings removes the highlight. **Hedge limit** always shows actual bot perpetual notional at the current mid price / applied maximum, with remaining capacity in its tooltip. It excludes pending orders and theoretical target positions. The trading limit calculation is unchanged; see [the hedge-limit review](docs/HEDGE_LIMIT_REVIEW.md) for why the old indicator could appear at zero inventory.
+Coverage defaults to 100%; 50% hedges half the current delta and 200% hedges twice the delta. There is no independent dollar hedge cap. Instrument quantity steps, fresh market data, margin and order ownership checks remain mandatory. Option API quantities are already in the underlying coin and are not multiplied by contract size again.
 
-The information area uses three compact frames without headings: delta (net, normalized and reference), hedge (inventory, notional limit and legs), and execution/escape (bot state, threshold and remaining cooldown). Market/P&L and connection/status fields use matching native Qt frames. **Actions** follows **Risk graph**; **P&L** is directly below **Advanced**. Apply uses the Grid Bot's original blue palette, stripe geometry and animation speed.
+`Normalized option delta = option delta / sum(abs(option quantity))`.
 
-The connection indicator follows Connect. Footer **Latency** is the exchange request round-trip time; **Data age** is the age of the latest perpetual quote, not another latency. **Clock** shows whether the exchange clock is ahead of or behind the PC. Per-option quote ages are in Data tooltips. A forward ticker timestamp of up to 1 second is tolerated to prevent harmless subsecond clock differences from breaking synchronization or flashing Live/Stale. Quotes older than 5 seconds, larger clock leads and invalid bid/ask still block trading. No system clock or stored timestamp is modified.
+Delta Change measures movement in normalized option delta; Cooldown defaults to 10 seconds. The minimum-change validation includes the coverage multiplier. Own hedge fills do not change option delta. A completed operation keeps the option-delta reference used to calculate its target, so market movement during execution remains eligible for the next decision. Changing coverage schedules recalculation at the next Start.
 
-**Risk graph** opens a separate, nonmodal snapshot of the construction at fixed current IV/time. It calculates once on opening and on **Refresh**. Choose Delta, Gamma, Theta or Vega without recalculation; resizing and minimizing also preserve the snapshot. The timestamp stays visible. P&L includes the current hedge, never hypothetical future hedge trades. The initial price range is +/-15%. Graphs are never computed while the window is closed.
+The main window separates the actual futures position, required futures quantity, BUY/SELL quantity to rebalance and the construction's delta goal. At 100% coverage the delta goal is zero; the futures target offsets the options and is generally nonzero. Rebalancing still obeys Delta Change and Cooldown. The tooltip gives current notional. Construction includes the perpetual as a separate leg with delta equal to its signed quantity and zero gamma/theta/vega. The risk graph includes the existing hedge, holds IV/time fixed and calculates only on request.
 
-The legend below the chart shows actual solid, dashed, dotted and vertical line samples beside their names. The dotted lower/upper delta triggers are scenario prices where normalized option delta reaches the escape threshold relative to the reference; hover for the values. The IV line shows each leg's implied volatility from the same snapshot, fixed until Refresh. There is no single averaged construction IV.
+The quote strip shows Bid, Ask and Middle Price `(bid + ask) / 2`. Rebalance band estimates the price move in percent from a hedge reference to the next Delta Change trigger: `100 * Delta Change * gross option quantity / abs(net option gamma) / Middle Price`. It is a local constant-gamma estimate, not the distance remaining from the current price. Its tooltip estimates turnover and one-way maker/taker commissions at the applied coverage; lot rounding, spread and slippage are excluded. Coverage scales turnover, not the price trigger.
 
-The two vertical axes scale independently with rounded ticks. Positive P&L starts at
-zero at the bottom; losses remain visible if the curve becomes negative. The selected
-Greek has a central zero and symmetric limits. Refresh preserves each scale unless
-values outgrow it or the P&L curve changes sign.
+Break-even is the approximate price move in percent: `100 * sqrt(2 * abs(net option theta) / net option gamma) / Middle Price` (the tooltip retains its USD equivalent) for positive net gamma and nonpositive theta, before trading costs, funding and IV changes. It uses signed quantities and the existing API Greeks. Deribit caps theta to remaining lifetime below one day: the caption then changes from `daily` to `<1d`, including mixed-expiry baskets. This is a capped-horizon estimate, not a full-day forecast. Missing, expired or stale inputs suppress both move estimates. Dollar Gamma in Construction is `0.5 * position gamma * Middle Price^2`, including the position sign. Multiply by the squared fractional price move to estimate gamma P&L (for a 1% move, multiply by `0.0001`). P&L is shown once, below Construction; its coverage warnings remain beside the period. These indicators use existing snapshots and add no exchange requests or realized-volatility history.
 
-## Delta Change and limits
+The theta horizon follows [Deribit's ticker Greeks documentation](https://docs.deribit.com/api-reference/market-data/public-ticker).
 
-`Normalized Delta = sum(signed option base quantity × per-unit option delta) / sum(abs(option base quantity))`.
+## Execution and recovery
 
-API option position amounts are already in the underlying coin: **do not multiply them by contract size again**. Individual ticker delta/gamma/theta/vega are multiplied by signed position quantity once. Account `DeltaTotal` uses a different price-adjusted convention and is not substituted for selected option Greeks.
+All orders are limit orders. **Balanced is the default**.
 
-For 0.1 BTC gross options, a move from delta 0.50 to 0.54 is **0.04 delta points**, **0.004 BTC** of changed exposure. A straddle includes both legs in gross quantity. Escape price markers in the risk graph are scenario indicators, not trading triggers. Time and IV can change delta without spot moving.
-
-The desired hedge is `-aggregate option delta`, rounded to the instrument's minimum amount and capped by the **whole-position** maximum notional, including open order exposure. Initial hedging may be partial at this cap. `HEDGE LIMIT REACHED` means directional exposure remains. Own hedge fills do not create option delta changes, and a capped/rounded target does not cause endless retries. A price-only increase in the value of existing inventory does not force a sale; further increases are blocked while reductions remain possible.
-
-The escape reference is the option basket's normalized delta at completion, including any market drift during execution. Execution drift and size rounding remain visible in net delta. Cooldown defaults to **10 seconds** after a completed decision. After cooldown the latest snapshot is evaluated; old signals are not queued. This is a rate-control choice, not an optimal economic threshold or a guarantee of bounded unhedged risk.
-
-## Execution and controls
-
-All trading uses limit orders. Accepted maker orders are repriced with `private/edit`; its amount is the total including fills, not an additional quantity. Cancellation is confirmed before changing direction or replacing a GTC order with IOC. Each profile has at most one unresolved trading mutation and one live hedge order.
-
-| Mode | Maker attempts before aggressive limit execution |
+| Policy | Passive attempts before crossing limit IOC |
 |---|---|
-| POST-ONLY (default) | Never becomes taker |
 | Balanced | Two |
 | Aggressive | One |
+| POST-ONLY | Never crosses |
 
-A maker attempt waits **2 seconds** by default. A post-only rejection also consumes an attempt. Aggressive orders cross the best opposite quote within the configured slippage limit (**5 bps** initially); new aggressive orders use IOC. A limit order can still pay taker fees. An accepted maker order is not a promise of timely execution. Partial fills reduce the outstanding requirement.
+Passive attempts wait 2 seconds by default. Balanced/Aggressive use ordinary GTC limit orders, BUY at bid and SELL at ask, without post-only. They can execute as taker if the book moves. POST-ONLY retains strict post-only/reject behavior. Crossing IOC prices respect the configured adverse slippage bound (default 5 bps). No-op edits are skipped without delaying escalation. Accepted maker orders do not guarantee execution.
 
-- **Stop and Cancel:** stop decisions and cancel only owned orders; positions remain.
-- **Close Hedge:** close only the bot's perpetual inventory using the selected limit policy. Options remain open. This can increase directional exposure of the remaining portfolio.
-- **New Session:** begin a new reporting period without changing inventory, orders, the strategy's delta reference or Lifetime history.
-- **Delete local profile:** the Grid Bot recovery path, also available after a position mismatch. After confirmation it cancels only this profile's exact order labels, verifies cancellation twice, reads the remaining exchange position, then creates a fresh empty profile in one database transaction. Local settings, trade history and accumulated P&L are cleared; export CSV first if needed. Exchange positions, manual/other-profile orders, exchange history and exported files remain. Failed cancellation or verification retains the profile and its P&L. A leftover perpetual is recorded as external, never adopted as a new bot hedge; close it on the exchange and reset again before starting Gamma.
+Partial executions are normal: only cumulative fill increases update inventory; duplicate order notifications and trade IDs are not counted twice. Editing uses total order amount including already filled quantity. Both create and edit limit reduce-only amounts to the remaining position. Reversals close the old side before opening the new side.
 
-Do not manually trade the selected options or hedge perpetual while this construction is in use, including while the bot is paused or closed. Stop & Cancel retains its position records. If you manually change those positions, export the old P&L and use Delete local profile before starting a new construction; there is no automatic import of manual trades.
+A position response can arrive before the matching fill notification. Such a mismatch suspends new orders and starts an owned-order/fill reconciliation. The bot waits for outstanding mutations, resolves original order labels, cancels any remainder and verifies the account position up to three times, at least 500 ms apart. Explained differences automatically restore the previous action, including Close hedge. Persistent unexplained differences pause trading with actual/expected quantities; profile/history are retained. Unknown request outcomes never authorize duplicate creates.
 
-Margin usage is `maintenance margin / margin balance`, calculated from exchange values. Cross collateral uses the total USD fields; segregated margin uses settlement account fields. **Advanced** shows the margin model and scope. The optional user threshold stops decisions and cancels orders, leaving inventory open. Disabling it retains margin freshness and execution checks. Reducing a perpetual does not guarantee lower portfolio margin. Margin freshness, available funds and the exchange order margin estimate are checked before increases. Missing/unsafe margin, stale selected data, external option quantity changes, position mismatches, storage failure and foreign hedge orders stop trading. Risk stops cancel orders and **do not automatically flatten**. Selected options enter an expiry pause 30 minutes before their own expiry. The hedge remains until a manual decision.
+The same bounded verification runs for a mismatch during initial connection. Mismatching raw position responses are retained in the event export for diagnosis. Manual position changes remain paused until explicitly reconciled; reconnecting does not silently adopt an external close or delete accounting history.
 
-Trading RPCs are spaced by at least **500 ms**; slower account limits take precedence. Creates/edits/cancels are prioritized over ordinary reads, mutations wait for the previous mutation outcome, and queued increases are checked again before sending. All RPCs have at least 100 ms spacing. Limits are shared with other API clients. Connection-scoped cancel-on-disconnect is enabled; the application does not change account-wide CoD configuration.
+The journal includes accepted/partly filled/filled/cancelled orders and request method, numerical error code and reason. `not_open_order` is reconciled rather than reported as a maker rejection. Each profile has at most one live hedge order and unresolved trading mutation. Trading RPCs retain at least 250 ms spacing (up to four requests/s; slower reported account limits take precedence). Reads have at least 100 ms spacing. Additional reconciliation/account reads run on anomalies, not on every market update. Account limits remain shared with other clients; see [Deribit rate limits, Appendix K](https://support.deribit.com/hc/en-us/articles/25944555524125-Deribit-Exchange-Rulebook-Deribit-FZE).
 
-## Accounting and export
+**Stop & Cancel** retains positions and cancels automatic resumption, including while disconnected. **Close hedge** targets zero using the selected execution policy; options remain open. Stale/invalid market data and temporary API congestion/rate-limit/settlement responses suspend requests and resume automatically once data and account state are verified. An excessive IOC spread waits for a price within the slippage bound. Foreign orders/trades, unexplained position differences, margin risk stops, insufficient funds, expiry and storage/invariant failures require explicit review. Risk stops cancel orders without automatically flattening. Selected options pause trading 30 minutes before expiry.
 
-The durable core database stores orders, original request intents and confirmed fills. An independent analytics database stores imported exchange transaction rows, reporting periods, valuation snapshots and events. Analytics/export/graph computation run outside the trading and GUI threads. The GUI polls a latest-snapshot mailbox at most 5 times per second and populates only visible tables. Reconciled historical valuations are cached and repriced using current marks; new/corrected imports, fills, funding state and construction changes invalidate the relevant calculations. Incomplete valuations use full replay. No UI acknowledgement is needed to hedge.
+Do not manually trade this construction while the bot owns it. A local process lock prevents duplicate ownership of the same account/environment/perpetual. Connection-scoped cancel-on-disconnect is enabled. After a connection loss the client reconnects automatically; the trading worker resolves original requests, verifies position and data, then restores the prior Hedge or Close action. Paused bots stay paused. An application restart always starts paused. Quote timestamps are adjusted to local time using the measured exchange clock offset; genuine old quotes are still rejected. Clock calibration is refreshed on anomalous market snapshots.
 
-| Period | Start |
-|---|---|
-| Lifetime | Last opening from flat of each selected current option episode; adds this bot's hedge sessions |
-| Session | New application run or New Session; baseline is the first coherent connected snapshot |
-| Today UTC | 00:00 UTC, if a valuation baseline is available; otherwise visibly partial |
+## One construction P&L
 
-Option history imports premiums, partial closes, fees and settlement information. Old closed option episodes and preexisting manual perpetual hedges are not silently attributed. Missing history/FX/valuation baselines are marked incomplete. Backfilling history rebases session comparisons consistently rather than creating a spurious session profit. Quotes/Greeks that were never recorded are not fabricated.
+The main window shows one P&L row below Construction/Orders/Journal, with the actual first-Start date and time in the computer's local timezone. It reports a single period, **since the first Start of this construction**, retained across application restarts:
 
-Perpetual average cost and realized P&L are maintained independently from daily exchange sessions. **Settlement at 08:00 UTC does not reset local Lifetime or Session P&L.** Funding combines unique settled transaction-log intervals with the current exchange session's `realized_funding`, excluding the pre-bot baseline. Current-session log intervals are not added twice. During settlement-log delay a recent saved boundary snapshot can carry the prior accrued amount provisionally; coverage remains incomplete until reconciliation. Settlement cashflows and `session_rpl` are audit inputs, not extra profit. There is no daily theta-coverage ratio: API theta is capped to the remaining option lifetime below 24 hours.
+`Net = options + hedge realized + hedge unrealized - option fees - hedge fees + funding`.
 
-All storage/export timestamps are UTC, unaffected by local DST. Values are shown as **USD equivalents, with USDC valued at $1**. Coin option premiums and commissions use their recorded index conversion when available; missing historical conversions are explicitly incomplete. This is a selected-positions report, not the USD return of all collateral or the account's coin cash balance. The graph holds current IV/time/carry fixed, anchors at actual marks and includes the existing hedge only; it does not predict future hedge P&L.
+The report subtracts the initial valuation from the current valuation. Historical imports revalue both sides consistently. Earlier option profit/loss and earlier fees are excluded from the new period. The breakdown shows the components of that same period; there is no New Session action or automatic daily/application-session reset.
 
-**Export CSV** writes a consistent set of UTF-8 BOM files that Excel can open: summaries, trades, fees/funding audit rows, Greeks/snapshots, events and sessions. Raw JSON accompanies flattened fields for auditability. Numerical data retains full precision. Export does not block the trading thread.
+Perpetual average-cost accounting is independent of Deribit's daily settlement. Funding combines unique settled intervals with current accrual, avoiding double counting. Incomplete history/FX/valuation is labelled; stale data shows the last available valuation. USDC is valued at $1; amounts are USD equivalents for the selected construction, not all account collateral. Perpetual P&L is not a separate measurement of pure gamma profit.
 
-## Development and validation
+**Export CSV** preserves raw trades, fees/funding, events, snapshots and legacy session rows, and adds `daily.csv` grouped by UTC day. Daily rows include actual observation boundaries and P&L changes over the recorded interval. Missing observations, unavailable history and open days remain explicitly partial; offline valuations are never invented.
 
-See [docs/BUILDING.md](docs/BUILDING.md). Tests use local fake WebSocket servers and temporary profiles, never live credentials. `DeribitGamma --demo` shows synthetic portfolio data without network/profile writes. `--demo --smoke-test --screenshot PATH` provides an offline UI check.
+## Existing profiles
 
-Source layout: `main.cpp` only creates the application and delegates startup to `ui/startup.cpp`. Palette, fonts and shared styles live in `ui/theme.h` and `ui/theme.cpp`. User setting defaults are defined once in `Config` (`engine/domain.h`); shared timing, exchange and safety constants are in `config/settings.h`. Application metadata is generated from CMake's project name/version.
+Migration preserves profile identity, positions, orders and history. Old dollar limits are ignored; coverage starts at 100% and execution migrates once to Balanced. Later explicit execution choices are retained. Since old profiles lack an exact first-Start valuation, their new P&L period begins on the next successful Start after updating. Old data remains exportable.
 
-The window is split into lifecycle, layout/actions, snapshot rendering, auxiliary windows (`ui/window_tools.cpp`) and offline fixtures. Shared confirmations are in `ui/dialogs.cpp`; number formatting is in `ui/format.h`. Scenario requests carry an ID and immutable trading snapshot; results for a closed window are discarded. Advanced diagnostics separate GUI/analytics calculation time, RPC queue time and hedge execution duration.
+Delete local profile remains an explicit destructive action: it cancels owned labels, verifies cancellation and clears local history/settings. It is not the normal recovery path for partial fills. Exchange positions remain and are not silently adopted.
 
-`trading/worker.h` owns the trading state. Its implementation is divided by responsibility: `worker.cpp` (lifecycle/persistence/snapshots), `connection.cpp`, `positions.cpp`, `market_data.cpp`, `orders.cpp`, `reconciliation.cpp`, `controls.cpp`, `execution.cpp` and `hedging.cpp`. These translation units share that one state owner; they do not create independent copies of inventory or configuration. `analytics/worker.cpp` publishes valuations, `analytics/history.cpp` handles typed history jobs and pagination, and `analytics/ledger_export.cpp` handles CSV serialization. Synthetic demo values and test scenarios are fixtures, not live trading defaults.
+## Development
 
-The original copied grid source is preserved in the initial Git commit. `legacy-archive/` contains the copied runtime/build artifacts and consistent old Production database snapshots; it is ignored by Git and packaging. Dependencies are cached in `.deps/`. No old production profile is migrated automatically.
+See [docs/BUILDING.md](docs/BUILDING.md). Tests use loopback fake WebSocket servers and temporary profiles; no real keys or exchange orders are used. `DeribitGamma --demo` opens an offline demonstration. Analytics, export and graph calculation remain outside the trading and GUI threads.
 
-MIT license; see `LICENSE`. Qt licensing and portable packaging are described in `THIRD_PARTY.md`.
+MIT license; see `LICENSE` and `THIRD_PARTY.md`.

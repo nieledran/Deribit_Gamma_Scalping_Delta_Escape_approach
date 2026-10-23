@@ -66,7 +66,7 @@ inline constexpr char TestnetUrl[] = "wss://test.deribit.com/ws/api/v2";
 // Fallback fee estimates; account-specific rates replace them when available.
 inline constexpr double DefaultMakerFee = .00015;
 inline constexpr double DefaultTakerFee = .00035;
-inline constexpr int MinimumTradingIntervalMs = 500;
+inline constexpr int MinimumTradingIntervalMs = 250;
 inline constexpr int ReadIntervalMs = 100;
 inline constexpr int InitialRetryMs = 1500;
 inline constexpr int MaxRetryMs = 30 * Time::SecondMs;

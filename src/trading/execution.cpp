@@ -22,14 +22,16 @@ void TradingWorker::preflight(std::function<void()> action, double amount, doubl
             if (!ok)
             {
                 busy = false;
-                fail("Margin data unavailable before hedge increase");
                 return;
             }
             QString safety = engine.safety(utcNow());
             if (!safety.isEmpty())
             {
                 busy = false;
-                fail(safety);
+                if (safety == engine.dataProblem(utcNow()))
+                    waitForData(safety);
+                else
+                    fail(safety);
                 return;
             }
             client->call(
@@ -45,9 +47,8 @@ void TradingWorker::preflight(std::function<void()> action, double amount, doubl
                             if (generation != epoch)
                                 return;
                             busy = false;
-                            if (!r.ok)
-                                throw std::runtime_error("Order margin estimate unavailable: " +
-                                                         r.error.toStdString());
+                            if (!acceptRead(r, "Order margin estimate unavailable"))
+                                return;
                             double needed = number(r.value.toObject(), buy ? "buy" : "sell");
                             if (needed < 0 || needed > engine.margin.available)
                                 throw std::runtime_error(
@@ -64,6 +65,8 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
     if (!owns(order))
         throw std::runtime_error("Order ownership is unverified");
     bool cancel = method == "private/cancel";
+    if (!cancel && engine.running)
+        status = engine.flattening ? "Closing hedge" : "Running";
     order.mutation = method;
     order.request = params;
     if (cancel)
@@ -105,9 +108,14 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
                     if (!r.ok)
                     {
                         log(QString("%1 failed: code %2, %3 (order %4)")
-                                .arg(method).arg(r.code).arg(r.error, label),
-                            {{"method", method}, {"code", r.code}, {"reason", r.error},
-                             {"label", label}, {"uncertain", r.uncertain}});
+                                .arg(method)
+                                .arg(r.code)
+                                .arg(r.error, label),
+                            {{"method", method},
+                             {"code", r.code},
+                             {"reason", r.error},
+                             {"label", label},
+                             {"uncertain", r.uncertain}});
                         if (r.uncertain)
                         {
                             o->uncertain = true;
@@ -120,10 +128,12 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
                         if (method == "private/buy" || method == "private/sell")
                         {
                             o->terminal = true;
-                            o->state = "rejected";
+                            o->state = r.error == "Request cancelled before send" ? "cancelled"
+                                                                                  : "rejected";
                         }
                         save();
-                        if (r.code == 11044 || r.code == 11008 || r.code == 10010 || r.code == 10004)
+                        if (r.code == 11044 || r.code == 11008 || r.code == 10010 ||
+                            r.code == 10004)
                         {
                             o->uncertain = true;
                             save();
@@ -138,13 +148,20 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
                             {
                                 o->uncertain = true;
                                 save();
-                                requestRecovery("Post-only edit rejected; checking remaining order");
+                                requestRecovery(
+                                    "Post-only edit rejected; checking remaining order");
                             }
                             return;
                         }
                         if (r.error == "Request cancelled before send")
                         {
                             log("Queued request cancelled before send");
+                            return;
+                        }
+                        if (r.retryable())
+                        {
+                            waitForData(r.error);
+                            retryAt = utcNow() + Time::SecondMs;
                             return;
                         }
                         fail(r.error);
@@ -212,7 +229,11 @@ void TradingWorker::submitNew(bool aggressive)
     p = tickPrice(p, tick, !buy);
     if (aggressive && std::abs(p - mid) / mid * Limits::BasisPoints > engine.config.slippageBps)
     {
-        fail("Spread exceeds the configured slippage limit");
+        if (status != "Waiting for narrower spread")
+            log("Spread exceeds the slippage bound; waiting automatically for a tradable price");
+        status = "Waiting for narrower spread";
+        retryAt = utcNow() + Exchange::MinimumTradingIntervalMs;
+        publish();
         return;
     }
     const bool postOnly = engine.config.execution == Execution::PostOnly;

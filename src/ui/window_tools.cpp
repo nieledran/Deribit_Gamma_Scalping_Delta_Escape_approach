@@ -199,41 +199,6 @@ void Window::requestRisk()
     riskTimestamp->setText("Calculating snapshot…");
     QMetaObject::invokeMethod(analytics, [w = analytics, request] { w->requestRisk(request); });
 }
-void Window::showPnl()
-{
-    if (pnlDialog)
-    {
-        pnlDialog->showNormal();
-        pnlDialog->raise();
-        return;
-    }
-    auto* dialog = new QDialog(this);
-    pnlDialog = dialog;
-    dialog->setObjectName("pnlDialog");
-    dialog->setAttribute(Qt::WA_DeleteOnClose);
-    dialog->setWindowTitle("Construction P&L — breakdown");
-    dialog->resize(940, 260);
-    auto* layout = new QVBoxLayout(dialog);
-    pnl = new QTableWidget(1, 8);
-    pnl->setObjectName("pnlSummary");
-    pnl->setHorizontalHeaderLabels({"Period", "Options", "Hedge realized", "Hedge unrealized",
-                                    "Fees", "Funding", "Net P&L", "Coverage"});
-    pnl->verticalHeader()->hide();
-    pnl->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    pnl->setAlternatingRowColors(true);
-    pnl->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
-    for (int col = 0; col < 8; ++col)
-        pnl->setColumnWidth(col, col == 0 || col == 7 ? 140 : 105);
-    pnl->horizontalHeader()->setStretchLastSection(true);
-    layout->addWidget(pnl);
-    auto* note = new QLabel("USD equivalents; USDC = $1. Hedge P&L is the perpetual contribution, "
-                            "not pure gamma profit. Missing history and baselines are marked.");
-    note->setWordWrap(true);
-    layout->addWidget(note);
-    connect(dialog, &QObject::destroyed, this, [this] { pnl = nullptr; });
-    dialog->show();
-    render();
-}
 void Window::showLeg(int row)
 {
     if (!positions->item(row, 0))
@@ -243,6 +208,21 @@ void Window::showLeg(int row)
     {
         std::lock_guard<std::mutex> lock(shared->mutex);
         s = shared->trading;
+    }
+    if (name == s.config.instrument)
+    {
+        auto* dialog = new QDialog(this);
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->setWindowTitle(name);
+        auto* form = new QFormLayout(dialog);
+        form->addRow("Quantity / delta:",
+                     new QLabel(displayNumber(s.inventory) + " " + s.config.base()));
+        form->addRow("Target:", new QLabel(displayNumber(s.target) + " " + s.config.base()));
+        form->addRow("Notional:",
+                     new QLabel("$" + displayNumber(std::abs(s.inventory) * s.quote.mid(), 2)));
+        form->addRow("Mark:", new QLabel(displayNumber(s.quote.mark, 2) + " USDC"));
+        dialog->show();
+        return;
     }
     for (const auto& o : s.positions)
         if (o.spec.name == name)
@@ -269,4 +249,3 @@ void Window::showLeg(int row)
         }
 }
 } // namespace scalper
-

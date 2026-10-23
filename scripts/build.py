@@ -51,9 +51,10 @@ try:
     if not args.skip_tests:
         run([Path(cmake).with_name('ctest.exe'), '--test-dir', build, '-C', 'Release', '--output-on-failure'])
 except subprocess.CalledProcessError:
-    report = build / 'runtime-tests.txt'
-    if report.exists():
-        print(report.read_text(encoding='utf-8', errors='replace'), flush=True)
+    for name in ('client-tests.txt', 'runtime-tests.txt', 'performance-tests.txt'):
+        report = build / name
+        if report.exists():
+            print(report.read_text(encoding='utf-8', errors='replace'), flush=True)
     raise
 if not args.skip_deploy and not args.asan:
     if args.skip_tests:

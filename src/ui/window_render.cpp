@@ -1,3 +1,4 @@
+#include "analytics/model.h"
 #include "ui/format.h"
 #include "ui/theme.h"
 #include "ui/window.h"
@@ -101,37 +102,120 @@ void Window::render()
     const QString missing = QString::fromUtf8("—");
     QString state = s.running ? "Running" : s.status == "Stopped" ? "Stopped" : "Paused";
     QString activityText;
+    if (!s.running && s.busy)
+    {
+        state = "Waiting";
+        activityText = s.status;
+    }
     if (s.running)
     {
-        if (s.busy)
+        if (s.status.startsWith("Waiting"))
+            activityText = s.status;
+        else if (s.busy || s.executing)
             activityText = "Executing";
         else if (s.cooldownUntil > utcNow())
             activityText = "Cooldown";
         else
             activityText = "Waiting for escape";
     }
-    label(risk, "Price: " + (s.quote.mid() > 0 ? displayNumber(s.quote.mid(), 2) : missing));
+    const bool validPrice =
+        s.quote.bid > 0 && s.quote.ask >= s.quote.bid && std::isfinite(s.quote.mid());
+    label(risk, "Middle Price: " + (validPrice ? displayNumber(s.quote.mid(), 2) : missing));
+    risk->setToolTip("Middle Price = (Bid + Ask) / 2, in USD.");
+    const bool freshMetrics =
+        ready && greeksReady && validPrice &&
+        (demo || (s.connected && s.quote.fresh(now) &&
+                  std::all_of(selected.begin(), selected.end(),
+                              [now](const Option& o)
+                              {
+                                  return std::abs(o.quantity) < Epsilon ||
+                                         (o.spec.expiry > now && o.freshGreeks(now));
+                              })));
+    const auto moves =
+        freshMetrics ? estimateMoves(g, s.quote.mid(), s.config.deltaChange) : MoveEstimates{};
+    label(rebalanceBand,
+          "Rebalance band: " +
+              (moves.rebalancePercent
+                   ? QString::fromUtf8("≈") + displayNumber(*moves.rebalancePercent, 3) + "%"
+                   : missing));
+    QString bandDetails =
+        "Approximate price move from a hedge reference to the next Delta Change trigger, "
+        "in either direction. Not the distance left from the current price.\n"
+        "100 x Delta Change x gross option quantity / |net option gamma| / Middle Price.\n"
+        "Local constant-gamma estimate; time, IV changes and Cooldown can change the result. "
+        "Coverage changes trade size, not this price threshold.\n";
+    if (freshMetrics && moves.rebalancePercent)
+    {
+        const double quantity = g.gross * s.config.deltaChange * s.config.hedgePercent / 100;
+        const double notional = quantity * s.quote.mid();
+        bandDetails += QString("At this band: ~%1 %2 turnover ($%3); one-way commission "
+                               "~$%4 maker / ~$%5 taker. Before lot rounding; excludes spread "
+                               "and slippage. Actual fills may mix both fee rates.")
+                           .arg(displayNumber(quantity), s.config.base(),
+                                displayNumber(notional, 2), displayNumber(notional * s.makerFee, 4),
+                                displayNumber(notional * s.takerFee, 4));
+    }
+    else
+        bandDetails += "Unavailable without fresh prices, complete Greeks and nonzero net gamma.";
+    rebalanceBand->setToolTip(bandDetails);
+    const bool shortHorizon = std::any_of(
+        selected.begin(), selected.end(), [now](const Option& o)
+        { return std::abs(o.quantity) > Epsilon && o.spec.expiry - now < Time::DayMs; });
+    label(breakEvenMove,
+          QString(shortHorizon ? "Break-even (<1d): %1" : "Break-even (daily): %1")
+              .arg(moves.breakEven
+                       ? QString::fromUtf8("≈") +
+                             displayNumber(100 * *moves.breakEven / s.quote.mid(), 3) + "%"
+                       : missing));
+    breakEvenMove->setToolTip(
+        (moves.breakEven ? "USD equivalent: ~$" + displayNumber(*moves.breakEven, 2) + ".\n"
+                         : QString()) +
+        "Approximate gamma/theta break-even move (%) = "
+        "100 x sqrt(2 x |total theta| / total gamma) / Middle Price.\n"
+        "Uses signed quantities of selected options; requires positive net gamma and "
+        "nonpositive theta. Constant Greeks; excludes fees, spread, funding and IV changes.\n"
+        "Deribit caps theta to remaining lifetime below one day. '<1d' marks a basket "
+        "containing such an option: this is then a capped-horizon estimate, not a full-day "
+        "forecast. Missing or stale inputs are shown as unavailable.");
     label(estimate, "Bot: " + state);
     label(netDeltaValue,
           QString("Net delta (%1): %2")
               .arg(s.config.base(), ready && greeksReady ? displayNumber(netDelta) : missing));
-    label(hedgeValue, QString("Hedge (%1): %2")
-                          .arg(s.config.base(), ready ? displayNumber(s.inventory) : missing));
+    label(hedgeValue, QString("Futures position: %1 %2")
+                          .arg(ready ? displayNumber(s.inventory) : missing, s.config.base()));
+    hedgeValue->setToolTip("Actual perpetual quantity. Negative = short; positive = long.");
     const bool knownHedgeValue = ready && s.quote.mid() > 0;
     const double usedNotional = std::abs(s.inventory) * s.quote.mid();
-    label(hedgeUsage, QString("Target: %1 | Left: %2 %3")
-                          .arg(ready ? displayNumber(s.target) : missing,
-                               ready ? displayNumber(s.target - s.inventory) : missing,
-                               s.config.base()));
-    hedgeUsage->setToolTip("Target at the applied delta coverage. Actual hedge notional: " +
+    label(hedgeUsage, QString("Futures target: %1 %2")
+                          .arg(ready ? displayNumber(s.target) : missing, s.config.base()));
+    hedgeUsage->setToolTip(
+        "Required futures position = -option delta x coverage / 100. "
+        "This is a quantity, not the total delta of the construction. Notional: " +
         (knownHedgeValue ? "$" + displayNumber(usedNotional, 2) : missing));
+    const double adjustment = s.target - s.inventory;
+    label(hedgeRemaining, !ready ? "To rebalance: " + missing
+                          : std::abs(adjustment) < Epsilon
+                              ? "To rebalance: 0 " + s.config.base()
+                              : QString("To rebalance: %1 %2 %3")
+                                    .arg(adjustment > 0 ? "BUY" : "SELL",
+                                         displayNumber(std::abs(adjustment)), s.config.base()));
+    hedgeRemaining->setToolTip(
+        "Target futures quantity minus actual quantity. A new hedge waits "
+        "for Delta Change and Cooldown; during execution this is the remaining quantity.");
+    label(targetDeltaValue,
+          QString("Delta goal (%1%): %2 %3")
+              .arg(displayNumber(s.config.hedgePercent, 2),
+                   ready && greeksReady ? displayNumber(g.delta * (1 - s.config.hedgePercent / 100))
+                                        : missing,
+                   s.config.base()));
     label(normalizedValue, "Normalized delta: " +
                                (ready && greeksReady ? displayNumber(g.normalized(), 4) : missing));
     label(referenceValue, "Reference delta: " +
                               (ready && s.anchored ? displayNumber(s.referenceDelta, 4) : missing));
     label(escapeValue, "Escape threshold: " + displayNumber(s.config.deltaChange, 4));
     label(legsValue, QString("%1 options + %2 perpetual")
-                         .arg(s.config.selected.size()).arg(std::abs(s.inventory) > Epsilon ? 1 : 0));
+                         .arg(s.config.selected.size())
+                         .arg(std::abs(s.inventory) > Epsilon ? 1 : 0));
     label(executionState, activityText);
     const qint64 cooldownLeft = s.running ? std::max<qint64>(0, s.cooldownUntil - now) : 0;
     label(activity,
@@ -139,17 +223,23 @@ void Window::render()
     const bool valued = a.ready && a.timestamp > 0 && a.constructionId == s.constructionId;
     const bool staleValuation = !demo && (!s.connected || !s.quote.fresh(now) ||
                                           now - a.timestamp > Time::MarketDataMaxAgeMs);
-    label(netPnl, "Net P&L: " + (valued ? displayNumber(a.pnl.net(), 2) : missing));
-    QStringList coverage;
+    label(pnlPeriod,
+          valued ? "Construction P&L (USD) | Since " + QDateTime::fromMSecsSinceEpoch(a.startedAt)
+                                                           .toLocalTime()
+                                                           .toString("yyyy-MM-dd HH:mm:ss 'UTC'ttt")
+                 : "Construction P&L (USD) | Starts on the first successful Start");
+    pnlPeriod->setToolTip("One period retained across Stop, reconnects and application restarts. "
+                          "Amounts are shown in USD; USDC is valued at $1.\n" +
+                          a.completeness);
+    QStringList pnlNotes;
     if (valued && !a.complete)
-        coverage << "Incomplete";
+        pnlNotes << "Incomplete";
     if (valued && staleValuation)
-        coverage << "Last valuation";
-    label(pnlCoverage, coverage.join(" | "));
+        pnlNotes << "Last valuation";
+    label(pnlCoverage, pnlNotes.join(" | "));
     pnlCoverage->setToolTip(
         a.completeness +
         (staleValuation ? "\nShowing the last valuation; prices are not fresh." : ""));
-    netPnl->setToolTip(a.completeness + (a.startedAt ? "\nSince " + isoUtc(a.startedAt) : ""));
     if (tabs->currentWidget() == positions)
     {
         const bool hasHedge = std::abs(s.inventory) > Epsilon;
@@ -164,19 +254,29 @@ void Window::render()
                  true);
             cell(positions, row, 3, o.hasGreeks ? displayNumber(o.quantity * o.gamma, 9) : missing,
                  true);
-            cell(positions, row, 4, o.hasGreeks ? displayNumber(o.quantity * o.theta, 3) : missing,
+            cell(positions, row, 4,
+                 o.hasGreeks && validPrice
+                     ? displayNumber(.5 * o.quantity * o.gamma * s.quote.mid() * s.quote.mid(), 2)
+                     : missing,
                  true);
-            cell(positions, row, 5, o.hasGreeks ? displayNumber(o.quantity * o.vega, 3) : missing,
+            positions->item(row, 4)->setToolTip(
+                positions->horizontalHeaderItem(4)->toolTip() +
+                (!demo && (!o.freshGreeks(now) || !s.quote.fresh(now))
+                     ? "\nLast available prices/Greeks; data is stale."
+                     : ""));
+            cell(positions, row, 5, o.hasGreeks ? displayNumber(o.quantity * o.theta, 3) : missing,
                  true);
-            cell(positions, row, 6,
+            cell(positions, row, 6, o.hasGreeks ? displayNumber(o.quantity * o.vega, 3) : missing,
+                 true);
+            cell(positions, row, 7,
                  o.hasGreeks ? displayNumber(o.mark, o.spec.inverse ? 6 : 2) : missing, true);
-            positions->item(row, 6)->setToolTip("Mark in " + o.spec.settlement);
+            positions->item(row, 7)->setToolTip("Mark in " + o.spec.settlement);
             const QString dataState = std::abs(o.quantity) < Epsilon      ? "Closed"
                                       : o.spec.expiry <= utcNow()         ? "Expired"
                                       : (demo || o.freshGreeks(utcNow())) ? "Live"
                                                                           : "Stale";
-            cell(positions, row, 7, dataState);
-            positions->item(row, 7)->setToolTip(
+            cell(positions, row, 8, dataState);
+            positions->item(row, 8)->setToolTip(
                 o.tickerAt > 0 ? QString("Last option update: %1 | age %2 ms")
                                      .arg(isoUtc(o.tickerAt))
                                      .arg(std::max<qint64>(0, now - o.tickerAt))
@@ -188,11 +288,13 @@ void Window::render()
             cell(positions, row, 0, s.config.instrument);
             cell(positions, row, 1, ready ? displayNumber(s.inventory) : missing, true);
             cell(positions, row, 2, ready ? displayNumber(s.inventory) : missing, true);
-            for (int col = 3; col <= 5; ++col)
+            for (int col = 3; col <= 6; ++col)
                 cell(positions, row, col, "0", true);
-            cell(positions, row, 6, s.quote.mark > 0 ? displayNumber(s.quote.mark, 2) : missing, true);
-            cell(positions, row, 7, ready && s.quote.fresh(now) ? "Live" : "Stale");
-            positions->item(row, 0)->setToolTip("Actual bot perpetual hedge; delta equals signed quantity.");
+            cell(positions, row, 7, s.quote.mark > 0 ? displayNumber(s.quote.mark, 2) : missing,
+                 true);
+            cell(positions, row, 8, ready && s.quote.fresh(now) ? "Live" : "Stale");
+            positions->item(row, 0)->setToolTip(
+                "Actual bot perpetual hedge; delta equals signed quantity.");
         }
     }
     if (tabs->currentWidget() == orders)
@@ -212,7 +314,7 @@ void Window::render()
             cell(orders, row, 5,
                  o.uncertain             ? "Uncertain"
                  : !o.mutation.isEmpty() ? o.mutation
-                 : o.state);
+                                         : o.state);
         }
     }
     if (tabs->currentWidget() == journal)
@@ -225,20 +327,22 @@ void Window::render()
         }
     }
     QString reason = demo ? "Offline demo: synthetic positions; exchange connection disabled."
-                     : !s.problem.isEmpty()        ? s.problem
-                     : !s.connected && !demo       ? "Enter API credentials and click Connect."
-                     : !s.synced && !demo          ? "Synchronizing positions and bot orders..."
+                     : !s.problem.isEmpty()           ? s.problem
+                     : s.status.startsWith("Waiting") ? s.status
+                     : !s.connected && !demo          ? "Enter API credentials and click Connect."
+                     : !s.synced && !demo             ? "Synchronizing positions and bot orders..."
                      : s.config.selected.isEmpty() ? "Select option positions, then Apply settings."
                      : !demo && !s.quote.fresh(now)
                          ? "Waiting for fresh bid/ask prices; trading is paused."
                      : !a.message.isEmpty() ? a.message
-                     : !valued              ? "Waiting for option prices to calculate P&L."
-                     : !a.complete  ? "P&L history incomplete; open Details for coverage."
+                     : !valued              ? "P&L begins at the first Start of this construction."
+                     : !a.complete          ? "P&L history incomplete; open Details for coverage."
                      : s.running            ? "Trading active."
                                             : "Ready. Press Start / Resume to hedge.";
     label(quality, reason);
     quality->setToolTip(reason + "\n" + a.historyStatus);
-    auto qualityStyle = !s.problem.isEmpty() ? QString(theme::AlertStyle) : QString();
+    auto qualityStyle =
+        !s.problem.isEmpty() && s.status == "Stopped" ? QString(theme::AlertStyle) : QString();
     if (quality->styleSheet() != qualityStyle)
         quality->setStyleSheet(qualityStyle);
     if (advancedDialog->isVisible())
@@ -255,17 +359,14 @@ void Window::render()
                             .arg(s.rpcQueueMs < 0 ? missing : QString::number(s.rpcQueueMs),
                                  s.lastHedgeMs < 0 ? missing : QString::number(s.lastHedgeMs))
                   : "Account margin data unavailable");
-    if (pnlDialog && pnlDialog->isVisible())
+    if (pnl->isVisible())
     {
         pnl->setRowCount(1);
         const auto& v = a.pnl;
-        cell(pnl, 0, 0, "Construction");
         const double nums[] = {v.options, v.realized, v.unrealized, v.optionFees + v.hedgeFees,
                                v.funding, v.net()};
-        for (int col = 1; col < 7; ++col)
-            cell(pnl, 0, col, valued ? displayNumber(nums[col - 1], col == 5 ? 4 : 2) : missing, true);
-        cell(pnl, 0, 7, !valued ? "Waiting for first Start"
-                       : a.complete ? "Since " + isoUtc(a.startedAt) : "Incomplete");
+        for (int col = 0; col < 6; ++col)
+            cell(pnl, 0, col, valued ? displayNumber(nums[col], col == 4 ? 4 : 2) : missing, true);
     }
     if (riskDialog && result.id == riskRequestId && displayedRiskId != result.id)
     {
@@ -291,13 +392,13 @@ void Window::render()
     label(status, s.connectionStatus);
     applyButton->setPending(dirty);
     startButton->setEnabled(!demo && s.synced && !s.running && !s.busy && !dirty);
-    stopButton->setEnabled(!demo && s.connected);
+    stopButton->setEnabled(!demo && (s.connected || s.busy));
     selectButton->setEnabled(!s.running && !s.busy);
     closeAction->setEnabled(!demo && s.synced && std::abs(s.inventory) > Epsilon && !s.busy);
     deleteAction->setEnabled(!demo && s.canDelete);
     closeAction->setToolTip(s.positionMismatch
-                                ? "Positions differ after an external trade. Export CSV, then "
-                                  "Delete local profile to restart."
+                                ? "Exchange position differs from known fills. Reconcile orders "
+                                  "and trade history before closing; profile history is retained."
                                 : "Close the bot's verified perpetual hedge; options remain open.");
     closeAction->setText(closeAction->isEnabled() ? "Close hedge" : "Close hedge (Locked)");
     deleteAction->setText(deleteAction->isEnabled() ? "Delete local profile"

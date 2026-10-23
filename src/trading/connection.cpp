@@ -16,6 +16,7 @@ void TradingWorker::connectExchange(QString id, QString secret)
             startPending = false;
             refreshingMarket = false;
             busy = false;
+            recovering = false;
             ++epoch;
             synced = false;
             syncing = false;
@@ -36,6 +37,9 @@ void TradingWorker::initializeExchange()
     syncing = true;
     busy = false;
     status = "Synchronizing";
+    engine.quote.at = 0;
+    for (auto& option : positions)
+        option.tickerAt = 0;
     const qint64 timeRequested = utcNow();
     client->call(
         "public/get_time", {},
@@ -59,8 +63,8 @@ void TradingWorker::initializeExchange()
                 {
                     if (generation != epoch)
                         return;
-                    if (!r.ok)
-                        throw std::runtime_error(r.error.toStdString());
+                    if (!acceptRead(r, "Read account summary"))
+                        return;
                     auto j = r.value.toObject();
                     auto v = j["id"];
                     QString id = v.isString() ? v.toString() : QString::number(v.toInteger());
@@ -111,8 +115,8 @@ void TradingWorker::initializeExchange()
                                 {
                                     if (generation != epoch)
                                         return;
-                                    if (!spec.ok)
-                                        throw std::runtime_error(spec.error.toStdString());
+                                    if (!acceptRead(spec, "Read hedge instrument"))
+                                        return;
                                     auto j = spec.value.toObject();
                                     engine.spec = Instrument::parse(j);
                                     if (engine.spec.kind != "future" ||
@@ -131,10 +135,9 @@ void TradingWorker::initializeExchange()
                                                 {
                                                     if (generation != epoch)
                                                         return;
-                                                    if (!cod.ok)
-                                                        throw std::runtime_error(
-                                                            "Cannot enable connection "
-                                                            "cancel-on-disconnect");
+                                                    if (!acceptRead(cod,
+                                                                    "Enable cancel-on-disconnect"))
+                                                        return;
                                                     loadPositions(
                                                         [this]
                                                         { subscribe([this] { reconcile(); }); },
@@ -169,8 +172,8 @@ void TradingWorker::loadMetadata(QStringList names, std::function<void()> done)
                     {
                         if (generation != epoch)
                             return;
-                        if (!r.ok)
-                            throw std::runtime_error(r.error.toStdString());
+                        if (!acceptRead(r, "Read option instrument"))
+                            return;
                         auto spec = Instrument::parse(r.value.toObject());
                         if (spec.kind != "option" || spec.base != engine.config.base() ||
                             (spec.settlement != "USDC" && spec.settlement != engine.config.base()))
@@ -204,8 +207,8 @@ void TradingWorker::subscribe(std::function<void()> done)
                          {
                              if (generation != epoch)
                                  return;
-                             if (!r.ok)
-                                 throw std::runtime_error(r.error.toStdString());
+                             if (!acceptRead(r, "Subscribe to market and account updates"))
+                                 return;
                              auto names = marketInstruments(true);
                              if (refreshingMarket || startPending)
                              {
@@ -246,10 +249,9 @@ void TradingWorker::refreshMargin(std::function<void(bool)> done)
                         if (!r.ok)
                         {
                             engine.margin.valid = false;
+                            acceptRead(r, "Refresh margin");
                             if (done)
                                 done(false);
-                            else
-                                fail("Margin refresh failed");
                             return;
                         }
                         engine.margin = Margin::parse(r.value.toObject(), utcNow());

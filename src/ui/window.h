@@ -58,16 +58,18 @@ class Window : public QMainWindow
     QTableWidget *positions = nullptr, *pnl = nullptr, *orders = nullptr;
     QTabWidget* tabs = nullptr;
     QLabel *status = nullptr, *latency = nullptr, *risk = nullptr, *estimate = nullptr,
-           *quality = nullptr, *netPnl = nullptr, *marginInfo = nullptr;
+           *quality = nullptr, *rebalanceBand = nullptr, *breakEvenMove = nullptr,
+           *marginInfo = nullptr;
     QLabel *dataAge = nullptr, *clockDifference = nullptr;
     QLabel *netDeltaValue = nullptr, *hedgeValue = nullptr, *hedgeUsage = nullptr,
            *normalizedValue = nullptr, *referenceValue = nullptr, *escapeValue = nullptr,
            *legsValue = nullptr, *activity = nullptr, *executionState = nullptr,
-           *pnlCoverage = nullptr;
+           *pnlCoverage = nullptr, *pnlPeriod = nullptr, *hedgeRemaining = nullptr,
+           *targetDeltaValue = nullptr;
     QuoteLabel *bidQuote = nullptr, *askQuote = nullptr;
     QPlainTextEdit* journal = nullptr;
     QDialog* advancedDialog = nullptr;
-    QPointer<QDialog> riskDialog, pnlDialog;
+    QPointer<QDialog> riskDialog;
     ProfileChart* chart = nullptr;
     QLabel *riskTimestamp = nullptr, *riskIv = nullptr;
     QPushButton* riskRefresh = nullptr;
@@ -82,7 +84,6 @@ class Window : public QMainWindow
     void selectOptions();
     void showRisk();
     void requestRisk();
-    void showPnl();
     void showLeg(int row);
 };
 } // namespace scalper

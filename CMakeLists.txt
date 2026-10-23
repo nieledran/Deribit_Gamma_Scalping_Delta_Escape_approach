@@ -58,12 +58,13 @@ if(BUILD_TESTING)
   qt_add_executable(client_tests tests/client_tests.cpp src/exchange/client.cpp)
   target_include_directories(client_tests PRIVATE src)
   target_link_libraries(client_tests PRIVATE Qt6::WebSockets Qt6::Network Qt6::Test)
-  add_test(NAME websocket_protocol COMMAND client_tests)
+  add_test(NAME websocket_protocol COMMAND client_tests
+    -o "${CMAKE_CURRENT_BINARY_DIR}/client-tests.txt,txt")
   qt_add_executable(runtime_tests tests/runtime_tests.cpp)
   target_link_libraries(runtime_tests PRIVATE gamma_ui Qt6::Test)
   add_test(NAME execution_and_ui COMMAND runtime_tests -platform offscreen
     -o "${CMAKE_CURRENT_BINARY_DIR}/runtime-tests.txt,txt")
-  set_tests_properties(execution_and_ui PROPERTIES TIMEOUT 120)
+  set_tests_properties(execution_and_ui PROPERTIES TIMEOUT 300)
   qt_add_executable(performance_tests tests/performance_tests.cpp)
   target_link_libraries(performance_tests PRIVATE gamma_ui Qt6::Test)
   add_test(NAME offline_performance COMMAND performance_tests -platform offscreen

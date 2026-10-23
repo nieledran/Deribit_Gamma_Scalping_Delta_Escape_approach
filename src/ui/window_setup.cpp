@@ -114,10 +114,10 @@ void Window::setupUi()
     band = spin("Delta Change", Limits::MaxDeltaChange, 5, defaults.deltaChange, "deltaChange");
     band->setToolTip("Change in normalized option delta since the last completed hedge.\n"
                      "0.50 to 0.54 = 0.04 points. Both straddle legs count in gross quantity.");
-    coverage =
-        spin("Delta coverage (%)", 1000000, 2, defaults.hedgePercent, "hedgePercent");
+    coverage = spin("Delta coverage (%)", 1000000, 2, defaults.hedgePercent, "hedgePercent");
     coverage->setMinimum(.01);
-    coverage->setToolTip("Target perpetual = -option delta x coverage / 100. 200% hedges twice the delta.");
+    coverage->setToolTip(
+        "Target perpetual = -option delta x coverage / 100. 200% hedges twice the delta.");
     cooldown = spin("Cooldown (s)", double(Limits::MaxCooldownMs) / 1000, 1,
                     defaults.cooldownMs / 1000.0, "cooldown");
     cooldown->setMinimum(.5);
@@ -158,11 +158,6 @@ void Window::setupUi()
         alignButton(button);
         controls->addWidget(button);
     }
-    auto* detail = new QPushButton("P&&L");
-    detail->setObjectName("pnlDetails");
-    alignButton(detail);
-    controls->addWidget(detail);
-    connect(detail, &QPushButton::clicked, this, &Window::showPnl);
     auto* actions = new QPushButton("Actions");
     actions->setObjectName("actions");
     alignButton(actions);
@@ -255,31 +250,25 @@ void Window::setupUi()
     auto* quotes = new QGridLayout(marketPanel);
     quotes->setContentsMargins(8, 4, 8, 4);
     // Fixed column proportions: text changes never resize neighbouring fields.
-    const int quoteWidths[] = {112, 8, 108, 108, 8, 137, 145, 105};
-    for (int col = 0; col < 8; ++col)
+    const int quoteWidths[] = {105, 105, 158, 8, 190, 190};
+    for (int col = 0; col < 6; ++col)
         quotes->setColumnStretch(col, quoteWidths[col]);
     risk = new StableLabel;
     risk->setObjectName("riskSummary");
-    quotes->addWidget(risk, 0, 0);
-    quotes->addWidget(new QLabel("|"), 0, 1);
+    quotes->addWidget(risk, 0, 2);
     bidQuote = new QuoteLabel("Bid", QColor("#319263"));
     bidQuote->setObjectName("bidQuote");
     askQuote = new QuoteLabel("Ask", QColor("#c64c55"));
     askQuote->setObjectName("askQuote");
-    quotes->addWidget(bidQuote, 0, 2);
-    quotes->addWidget(askQuote, 0, 3);
-    quotes->addWidget(new QLabel("|"), 0, 4);
-    netPnl = new StableLabel;
-    netPnl->setText("Net P&L: —");
-    netPnl->setObjectName("netPnl");
-    netPnl->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-    quotes->addWidget(netPnl, 0, 5);
-    auto* period = new StableLabel;
-    period->setText("USD eq. | Since first Start");
-    quotes->addWidget(period, 0, 6);
-    pnlCoverage = new StableLabel;
-    pnlCoverage->setObjectName("pnlCoverage");
-    quotes->addWidget(pnlCoverage, 0, 7);
+    quotes->addWidget(bidQuote, 0, 0);
+    quotes->addWidget(askQuote, 0, 1);
+    quotes->addWidget(new QLabel("|"), 0, 3);
+    rebalanceBand = new StableLabel;
+    rebalanceBand->setObjectName("rebalanceBand");
+    quotes->addWidget(rebalanceBand, 0, 4);
+    breakEvenMove = new StableLabel;
+    breakEvenMove->setObjectName("breakEvenMove");
+    quotes->addWidget(breakEvenMove, 0, 5);
     layout->addWidget(marketPanel);
     auto* metrics = new QHBoxLayout;
     metrics->setSpacing(3);
@@ -288,7 +277,7 @@ void Window::setupUi()
         auto* panel = new QFrame;
         panel->setFrameShape(QFrame::StyledPanel);
         panel->setObjectName(name);
-        panel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+        panel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
         auto* fields = new QGridLayout(panel);
         fields->setContentsMargins(8, 4, 8, 4);
         fields->setVerticalSpacing(0);
@@ -309,9 +298,11 @@ void Window::setupUi()
     netDeltaValue = metric(deltaFields, 0, "netDeltaValue");
     normalizedValue = metric(deltaFields, 1, "normalizedDelta");
     referenceValue = metric(deltaFields, 2, "referenceDelta");
+    targetDeltaValue = metric(deltaFields, 3, "targetNetDelta");
     hedgeValue = metric(hedgeFields, 0, "hedgeValue");
     hedgeUsage = metric(hedgeFields, 1, "hedgeUsage");
-    legsValue = metric(hedgeFields, 2, "legsValue");
+    hedgeRemaining = metric(hedgeFields, 2, "hedgeRemaining");
+    legsValue = metric(hedgeFields, 3, "legsValue");
     auto* stateRow = new QGridLayout;
     stateRow->setColumnStretch(0, 1);
     stateRow->setColumnStretch(1, 2);
@@ -324,22 +315,26 @@ void Window::setupUi()
     executionFields->addLayout(stateRow, 0, 0);
     escapeValue = metric(executionFields, 1, "escapeDelta");
     activity = metric(executionFields, 2, "tradingActivity");
+    executionFields->setRowStretch(3, 1);
     layout->addLayout(metrics);
     tabs = new QTabWidget;
     tabs->setObjectName("mainTabs");
-    positions =
-        table({"Instrument", "Qty", "Delta", "Gamma", "Theta", "Vega", "Mark", "Data"});
+    positions = table(
+        {"Instrument", "Qty", "Delta", "Gamma", "Dollar Gamma", "Theta", "Vega", "Mark", "Data"});
     positions->setObjectName("optionPositions");
     positions->horizontalHeader()->setStretchLastSection(false);
     positions->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    const int widths[] = {0, 70, 85, 90, 70, 70, 80, 55};
-    for (int col = 1; col < 8; ++col)
+    const int widths[] = {0, 65, 80, 85, 95, 65, 65, 75, 50};
+    for (int col = 1; col < 9; ++col)
         positions->setColumnWidth(col, widths[col]);
     positions->horizontalHeaderItem(2)->setToolTip("Position delta (coin)");
     positions->horizontalHeaderItem(3)->setToolTip("Position gamma (coin per USD)");
     positions->horizontalHeaderItem(4)->setToolTip(
+        "0.5 x position gamma x Middle Price squared (USD). Multiply by the squared fractional "
+        "price move: for 1%, multiply this value by 0.0001. Signed quantity included.");
+    positions->horizontalHeaderItem(5)->setToolTip(
         "Position theta (USD, API remaining-lifetime cap)");
-    positions->horizontalHeaderItem(5)->setToolTip("Position vega (USD per volatility point)");
+    positions->horizontalHeaderItem(6)->setToolTip("Position vega (USD per volatility point)");
     positions->setToolTip("Double-click a leg for Greeks and contract details.");
     tabs->addTab(positions, "Construction");
     orders = table({"Side", "Price", "Amount", "Filled", "Execution", "State"});
@@ -356,6 +351,35 @@ void Window::setupUi()
     connect(tabs, &QTabWidget::currentChanged, this, [this] { render(); });
     connect(positions, &QTableWidget::cellDoubleClicked, this,
             [this](int row, int) { showLeg(row); });
+    auto* pnlPanel = new QFrame;
+    pnlPanel->setObjectName("pnlPanel");
+    pnlPanel->setFrameShape(QFrame::StyledPanel);
+    auto* pnlLayout = new QVBoxLayout(pnlPanel);
+    pnlLayout->setContentsMargins(6, 4, 6, 4);
+    pnlLayout->setSpacing(3);
+    pnlPeriod = new StableLabel;
+    pnlPeriod->setObjectName("pnlPeriod");
+    auto* pnlCaption = new QHBoxLayout;
+    pnlCaption->addWidget(pnlPeriod, 4);
+    pnlCoverage = new StableLabel;
+    pnlCoverage->setObjectName("pnlCoverage");
+    pnlCaption->addWidget(pnlCoverage, 1);
+    pnlLayout->addLayout(pnlCaption);
+    pnl = table({"Options", "Futures closed", "Futures open", "Fees", "Funding", "Total P&L"});
+    pnl->setObjectName("pnlSummary");
+    pnl->setRowCount(1);
+    pnl->setSelectionMode(QAbstractItemView::NoSelection);
+    pnl->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    pnl->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    pnl->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    pnl->setFixedHeight(pnl->horizontalHeader()->sizeHint().height() +
+                        pnl->verticalHeader()->defaultSectionSize() + 4);
+    pnl->horizontalHeaderItem(2)->setToolTip(
+        "Change in open futures P&L since this construction's first Start.");
+    pnl->horizontalHeaderItem(3)->setToolTip(
+        "Option and futures commissions since first Start; deducted from total P&L.");
+    pnlLayout->addWidget(pnl);
+    layout->addWidget(pnlPanel);
     auto* footer = new QHBoxLayout;
     auto* connectionPanel = new QFrame;
     connectionPanel->setObjectName("connectionPanel");
@@ -374,8 +398,8 @@ void Window::setupUi()
     dataAge = new StableLabel;
     dataAge->setText("Data age: — ms");
     dataAge->setObjectName("quoteAge");
-    dataAge->setToolTip("Age of the latest perpetual quote, not network round-trip latency. A "
-                        "small exchange clock lead is tolerated.");
+    dataAge->setToolTip(
+        "Age of the latest perpetual quote, adjusted for the measured exchange clock difference.");
     connection->addWidget(dataAge, 0, 2);
     connection->addWidget(new QLabel("|"), 0, 3);
     clockDifference = new StableLabel;
@@ -419,7 +443,7 @@ void Window::setupDialogs()
     advanced->addRow("Execution:", execution);
     connect(execution, &QComboBox::currentIndexChanged, this, [this] { markDirty(); });
     makerWait =
-        add("Maker attempt (s):", .5, double(Limits::MaxMakerWaitMs) / 1000, 1, "makerWait");
+        add("Passive attempt (s):", .5, double(Limits::MaxMakerWaitMs) / 1000, 1, "makerWait");
     slippage = add("Slippage limit (bps):", .01, Limits::MaxSlippageBps, 2, "slippage");
     marginEnabled = new QCheckBox("Stop at account MM usage");
     marginEnabled->setObjectName("marginLimitEnabled");

@@ -20,6 +20,7 @@ class Hedger
     qint64 completedAt = 0;
     Hedge operation;
     QString problem;
+    QString dataProblem(qint64 now, bool requireOptions = true) const;
     QString safety(qint64 now, bool requireOptions = true) const;
     bool start(qint64 now);
     void stop(const QString& reason = {});

@@ -17,6 +17,11 @@ struct RpcResult
     QString error;
     bool uncertain = false;
     int code = 0;
+    bool retryable() const
+    {
+        return !ok && (code == 0 || code == 10028 || code == 10040 || code == 10041 ||
+                       code == 10047 || code == 10050 || code == 10066 || code == 11051);
+    }
 };
 
 class Client : public QObject
@@ -29,6 +34,7 @@ class Client : public QObject
     void connectTo(const QString& id, const QString& secret, bool production,
                    const QUrl& testEndpoint = {});
     void stop();
+    void reconnect();
     qint64 call(const QString& method, const QJsonObject& params, Callback callback,
                 bool mutation = false, bool priority = false,
                 std::function<bool()> beforeSend = {});

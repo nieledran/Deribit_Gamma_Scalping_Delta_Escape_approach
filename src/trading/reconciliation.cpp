@@ -8,8 +8,6 @@ void TradingWorker::requestRecovery(const QString& reason)
 {
     if (recovering)
         return;
-    recoveryRunning = engine.running;
-    recoveryClose = engine.flattening || desiredClose;
     recoveryChecks = 0;
     recoveryReadyAt = 0;
     recovering = true;
@@ -26,66 +24,74 @@ void TradingWorker::recoverPosition()
     if (utcNow() < recoveryReadyAt)
         return;
     syncing = true;
-    reconcileOrder(0, [this]
-    {
-        if (!recovering)
-            return;
-        if (auto* live = liveOrder())
+    reconcileOrder(
+        0,
+        [this]
         {
-            syncing = false;
-            cancelOrder(*live);
-            return;
-        }
-        recoverTrades(0, [this]
-        {
-            const auto before = positionRevision;
-            loadPositions([this, before]
+            if (!recovering)
+                return;
+            if (auto* live = liveOrder())
             {
-                if (!recovering)
-                    return;
-                const bool matching = before == positionRevision &&
-                    std::abs(actualPosition - expectedPosition()) <= engine.spec.step * .1;
                 syncing = false;
-                if (!matching && ++recoveryChecks < 3)
+                cancelOrder(*live);
+                return;
+            }
+            recoverTrades(
+                0,
+                [this]
                 {
-                    recoveryReadyAt = utcNow() + Time::FillRecoveryDelayMs;
-                    return;
-                }
-                if (!matching || foreignOrders || selectionReview)
-                {
-                    fail(QString("Position reconciliation stopped: exchange %1, expected %2 %3; "
-                                 "difference %4. Profile and history retained; review and reconnect.")
-                             .arg(actualPosition, 0, 'g', 12).arg(expectedPosition(), 0, 'g', 12)
-                             .arg(engine.config.base()).arg(actualPosition - expectedPosition(), 0, 'g', 12));
-                    return;
-                }
-                recovering = false;
-                synced = true;
-                engine.active = false;
-                attempts = 0;
-                engine.problem.clear();
-                engine.running = recoveryRunning || recoveryClose;
-                engine.flattening = recoveryClose;
-                if (engine.running)
-                {
-                    const auto reason = engine.flattening
-                        ? (engine.quote.fresh(utcNow()) ? QString() : QString("Fresh quote required to close hedge"))
-                        : engine.safety(utcNow());
-                    if (!reason.isEmpty())
-                    {
-                        fail(reason);
-                        return;
-                    }
-                }
-                status = engine.running ? (engine.flattening ? "Closing hedge" : "Running") : "Paused";
-                save();
-                log("Own orders and fills reconciled; previous action restored",
-                    {{"inventory", engine.inventory}, {"running", engine.running},
-                     {"closing", engine.flattening}});
-                publish();
-            }, true);
+                    const auto before = positionRevision;
+                    loadPositions(
+                        [this, before]
+                        {
+                            if (!recovering)
+                                return;
+                            syncing = false;
+                            if (before != positionRevision)
+                            {
+                                recoveryChecks = 0;
+                                recoveryReadyAt = utcNow() + Time::FillRecoveryDelayMs;
+                                return;
+                            }
+                            const bool matching = std::abs(actualPosition - expectedPosition()) <=
+                                                  engine.spec.step * .1;
+                            if (!matching && ++recoveryChecks < 3)
+                            {
+                                recoveryReadyAt = utcNow() + Time::FillRecoveryDelayMs;
+                                return;
+                            }
+                            if (!matching || foreignOrders || selectionReview)
+                            {
+                                fail(QString("Position reconciliation stopped: exchange %1, "
+                                             "expected %2 %3; "
+                                             "difference %4 after %5 checks. Profile and history "
+                                             "retained; verify the exchange position and trade "
+                                             "history, then reconnect.")
+                                         .arg(actualPosition, 0, 'g', 12)
+                                         .arg(expectedPosition(), 0, 'g', 12)
+                                         .arg(engine.config.base())
+                                         .arg(actualPosition - expectedPosition(), 0, 'g', 12)
+                                         .arg(recoveryChecks));
+                                return;
+                            }
+                            recovering = false;
+                            synced = true;
+                            engine.active = false;
+                            attempts = 0;
+                            engine.problem.clear();
+                            waitingData = requested != RunRequest::None;
+                            status = "Paused";
+                            save();
+                            log("Own orders, fills and account position reconciled",
+                                {{"inventory", engine.inventory},
+                                 {"running", engine.running},
+                                 {"closing", engine.flattening}});
+                            publish();
+                            resumeRequested();
+                        },
+                        true);
+                });
         });
-    });
 }
 void TradingWorker::reconcile()
 {
@@ -99,8 +105,8 @@ void TradingWorker::reconcile()
                 {
                     if (generation != epoch)
                         return;
-                    if (!r.ok)
-                        throw std::runtime_error(r.error.toStdString());
+                    if (!acceptRead(r, "Read open hedge orders"))
+                        return;
                     if (!r.value.isArray())
                         throw std::runtime_error("Invalid open orders response");
                     foreignOrders = false;
@@ -114,22 +120,23 @@ void TradingWorker::reconcile()
                                 0,
                                 [this]
                                 {
+                                    const auto before = positionRevision;
                                     loadPositions(
-                                        [this]
+                                        [this, before]
                                         {
-                                            if (std::abs(actualPosition - expectedPosition()) >
-                                                engine.spec.step * .1)
-                                                throw std::runtime_error(
-                                                    QString(
-                                                        "Position mismatch: exchange %1, bot "
-                                                        "%2 %3. "
-                                                        "Do not trade this construction manually. "
-                                                        "Export CSV, then use Actions > Delete "
-                                                        "local profile.")
-                                                        .arg(actualPosition, 0, 'g', 10)
-                                                        .arg(expectedPosition(), 0, 'g', 10)
-                                                        .arg(engine.config.base())
-                                                        .toStdString());
+                                            emit historyConnect(clientId, clientSecret,
+                                                                engine.config.production, account,
+                                                                endpoint);
+                                            if (before != positionRevision ||
+                                                std::abs(actualPosition - expectedPosition()) >
+                                                    engine.spec.step * .1)
+                                            {
+                                                syncing = false;
+                                                requestRecovery("Connection position differs from "
+                                                                "known fills; verifying orders "
+                                                                "and position again");
+                                                return;
+                                            }
                                             syncing = false;
                                             synced = true;
                                             engine.active = false;
@@ -145,10 +152,9 @@ void TradingWorker::reconcile()
                                             save();
                                             log("Reconciliation complete; review settings and "
                                                 "press Start / Resume");
-                                            emit historyConnect(clientId, clientSecret,
-                                                                engine.config.production, account,
-                                                                endpoint);
                                             publish();
+                                            waitingData = requested != RunRequest::None;
+                                            resumeRequested();
                                         },
                                         true);
                                 });
@@ -187,6 +193,11 @@ void TradingWorker::reconcileOrder(int index, std::function<void()> done)
                                                              ? QJsonObject()
                                                              : r.value.toArray().first().toObject())
                                                       : r.value.toObject();
+                    if (r.retryable())
+                    {
+                        acceptRead(r, "Resolve original order");
+                        return;
+                    }
                     if (!r.ok || j.isEmpty())
                     {
                         // A missing create reply is never permission to resend. Keep its durable
@@ -229,10 +240,9 @@ void TradingWorker::resolveAbsentOrder(int index, std::function<void()> done)
                 {
                     if (generation != epoch)
                         return;
-                    if (!cancellation.ok)
-                        throw std::runtime_error(
-                            "Cannot confirm cancellation of unresolved label: " +
-                            label.toStdString());
+                    if (!acceptRead(cancellation,
+                                    "Confirm cancellation of unresolved label " + label))
+                        return;
                     scanOrderWindow(index, 0, {}, std::move(done));
                 });
         },
@@ -261,7 +271,9 @@ void TradingWorker::scanOrderWindow(int index, int phase, QJsonArray accumulated
                 {
                     if (generation != epoch)
                         return;
-                    if (!history.ok || !history.value.toObject()["trades"].isArray() ||
+                    if (!acceptRead(history, "Recover original order trade window"))
+                        return;
+                    if (!history.value.toObject()["trades"].isArray() ||
                         !history.value.toObject()["has_more"].isBool() ||
                         history.value.toObject()["has_more"].toBool())
                         throw std::runtime_error("Incomplete trade window for unresolved label; "
@@ -364,9 +376,8 @@ void TradingWorker::recoverTrades(int index, std::function<void()> done, bool hi
                 {
                     if (generation != epoch)
                         return;
-                    if (!r.ok)
-                        throw std::runtime_error("Cannot recover order fills: " +
-                                                 r.error.toStdString());
+                    if (!acceptRead(r, "Recover order fills"))
+                        return;
                     if (!r.value.isArray() && !r.value.toObject()["trades"].isArray())
                         throw std::runtime_error("Invalid order fills response");
                     auto a = r.value.isArray() ? r.value.toArray()

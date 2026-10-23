@@ -84,11 +84,17 @@ void TradingWorker::receiveOrder(const QJsonObject& j, bool response)
     if (!storageFailed)
         store->event("order_update", j);
     if (change > Epsilon || changedState)
-        log(QString("%1 %2: %3; filled %4 / %5, remaining %6 %7 at limit %8")
+        log(QString("%1 %2: %3; filled %4 / %5, remaining %6 %7 at limit %8; average fill %9")
                 .arg(o->buy ? "BUY" : "SELL", id, state)
-                .arg(filled, 0, 'g', 10).arg(total, 0, 'g', 10)
-                .arg(std::max(0.0, total - filled), 0, 'g', 10).arg(engine.config.base())
-                .arg(o->price, 0, 'g', 12), j);
+                .arg(filled, 0, 'g', 10)
+                .arg(total, 0, 'g', 10)
+                .arg(std::max(0.0, total - filled), 0, 'g', 10)
+                .arg(engine.config.base())
+                .arg(o->price, 0, 'g', 12)
+                .arg(j["average_price"].toDouble() > 0
+                         ? QString::number(j["average_price"].toDouble(), 'g', 12)
+                         : QString("unavailable")),
+            j);
 }
 void TradingWorker::receiveTrades(const QJsonArray& trades)
 {

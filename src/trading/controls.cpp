@@ -1,5 +1,5 @@
-#include "trading/worker.h"
 #include "analytics/ledger.h"
+#include "trading/worker.h"
 #include <QUuid>
 #include <stdexcept>
 namespace scalper
@@ -9,7 +9,8 @@ void TradingWorker::applyConfig(Config c)
     guard(
         [&]
         {
-            if (!synced || engine.running || busy || startPending || liveOrder())
+            if (!synced || requested != RunRequest::None || engine.running || busy ||
+                startPending || liveOrder())
                 throw std::runtime_error(
                     "Stop, cancel and reconcile orders before applying settings");
             if (c.instrument != engine.config.instrument ||
@@ -105,6 +106,8 @@ void TradingWorker::startMarketRefresh()
                       [this](bool ok)
                       {
                           busy = false;
+                          if (!ok && startPending && client->authenticated() && synced)
+                              return; // Keep the Start request until the next market refresh.
                           const bool requested = startPending;
                           startPending = false;
                           if (ok && requested)
@@ -133,6 +136,9 @@ void TradingWorker::completeStart()
                 log("Construction P&L started", {{"at", snapshot.timestamp}});
             }
             engine.problem.clear();
+            requested = RunRequest::Hedge;
+            waitingData = false;
+            retryAt = 0;
             attempts = 0;
             status = "Running";
             save();
@@ -146,7 +152,9 @@ void TradingWorker::stopTrading()
     guard(
         [&]
         {
-            recoveryRunning = recoveryClose = false;
+            requested = RunRequest::None;
+            waitingData = false;
+            retryAt = 0;
             engine.stop();
             desiredClose = false;
             status = "Paused";
@@ -163,16 +171,24 @@ void TradingWorker::closeHedge()
     guard(
         [&]
         {
-            if (!synced || foreignOrders || storageFailed ||
-                utcNow() - positionAt > Time::MarketDataMaxAgeMs ||
-                std::abs(actualPosition - expectedPosition()) > engine.spec.step * .1)
+            if (!synced || foreignOrders || storageFailed)
                 throw std::runtime_error(
                     "Reconcile a fresh matching account position before closing the hedge");
             engine.stop();
+            engine.problem.clear();
+            requested = RunRequest::Close;
+            waitingData = false;
+            retryAt = 0;
             desiredClose = true;
             status = "Closing hedge";
             if (requestId)
                 client->cancelQueued(requestId);
+            if (utcNow() - positionAt > Time::MarketDataMaxAgeMs ||
+                std::abs(actualPosition - expectedPosition()) > engine.spec.step * .1)
+            {
+                waitForData("Verifying account position before Close hedge");
+                poll();
+            }
             save();
             pump();
         });

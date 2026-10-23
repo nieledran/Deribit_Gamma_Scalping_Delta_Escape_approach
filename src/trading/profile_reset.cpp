@@ -11,11 +11,15 @@ void TradingWorker::deleteData()
         [&]
         {
             if (!client || !client->authenticated() || account.isEmpty() || !accountLock ||
-                !accountLock->isLocked() || syncing || busy || startPending || engine.running ||
+                !accountLock->isLocked() || syncing || recovering ||
+                requested != RunRequest::None || busy || startPending || engine.running ||
                 storageFailed)
                 throw std::runtime_error(
                     "Connect to the bound account and stop trading before deleting this profile");
             // Like Grid Bot: cancel this profile's exact labels, verify twice, then recreate.
+            recovering = false;
+            requested = RunRequest::None;
+            waitingData = false;
             ++epoch;
             resettingProfile = syncing = busy = true;
             synced = polling = refreshingMarket = desiredClose = false;

@@ -3,6 +3,22 @@
 #include <numbers>
 namespace scalper
 {
+MoveEstimates estimateMoves(const Greeks& g, double price, double deltaChange)
+{
+    MoveEstimates result;
+    if (!std::isfinite(g.gamma) || g.gamma == 0)
+        return result;
+    const double band = 100 * deltaChange * g.gross / std::abs(g.gamma) / price;
+    if (price > 0 && std::isfinite(price) && deltaChange > 0 && g.gross > 0 && std::isfinite(band))
+        result.rebalancePercent = band;
+    if (g.gamma > 0 && g.theta <= 0)
+    {
+        const double breakEven = std::sqrt(2 * std::abs(g.theta) / g.gamma);
+        if (std::isfinite(breakEven))
+            result.breakEven = breakEven;
+    }
+    return result;
+}
 static double cdf(double x)
 {
     return .5 * std::erfc(-x / std::numbers::sqrt2);

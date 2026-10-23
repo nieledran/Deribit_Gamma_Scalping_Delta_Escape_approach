@@ -3,6 +3,19 @@
 #include <stdexcept>
 namespace scalper
 {
+QString Hedger::dataProblem(qint64 now, bool requireOptions) const
+{
+    if (!quote.fresh(now))
+        return "Perpetual prices are older than 5 s or bid/ask is invalid. Trading paused.";
+    if (!margin.valid || margin.at <= 0 || now < margin.at ||
+        now - margin.at > Time::MarginDataMaxAgeMs)
+        return "Margin data is stale or unavailable";
+    if (requireOptions)
+        for (const auto& o : options)
+            if (!o.freshGreeks(now))
+                return "Selected option market data is stale or unavailable";
+    return {};
+}
 QString Hedger::safety(qint64 now, bool requireOptions) const
 {
     if (!quote.fresh(now))
@@ -37,7 +50,8 @@ bool Hedger::start(qint64 now)
         problem = safety(now);
     if (!problem.isEmpty())
         return false;
-    if (aggregate(options).gross * config.deltaChange * config.hedgePercent / 100 + Epsilon < spec.step)
+    if (aggregate(options).gross * config.deltaChange * config.hedgePercent / 100 + Epsilon <
+        spec.step)
     {
         problem = "Delta Change implies a hedge below the minimum order amount; increase the band";
         return false;
@@ -153,13 +167,13 @@ void Hedger::restore(const QJsonObject& j)
     config = Config::fromJson(j["config"].toObject());
     inventory = number(j, "inventory");
     referenceDelta = number(j, "reference_delta");
-    anchored = j["anchored"].toBool();
+    // Removing the old cap changes the target even if option delta has not moved.
+    anchored = j["config"].toObject().contains("hedge_percent") && j["anchored"].toBool();
     completedAt = j["completed_at"].toInteger();
     active = j["active"].toBool();
     flattening = j["flattening"].toBool();
     operation = {number(j, "operation_target"), number(j, "operation_delta"),
-                 number(j, "operation_normalized"),
-                 j["operation_initial"].toBool()};
+                 number(j, "operation_normalized"), j["operation_initial"].toBool()};
     for (auto v : j["options"].toArray())
         options.append(Option::fromJson(v.toObject()));
     running = false; // A restart always requires an explicit Start.

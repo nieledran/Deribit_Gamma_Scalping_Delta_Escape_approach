@@ -153,6 +153,12 @@ Client::ConnectionStatus Client::connectionStatus() const
     return status;
 }
 
+void Client::reconnect()
+{
+    if (wanted && socket.state() != QAbstractSocket::UnconnectedState)
+        socket.abort();
+}
+
 qint64 Client::call(const QString& method, const QJsonObject& params, Callback callback,
                     bool mutation, bool priority, std::function<bool()> beforeSend)
 {
@@ -288,6 +294,18 @@ void Client::receiveAuthentication(const RpcResult& r, bool renew)
 {
     if (!r.ok)
     {
+        if (r.retryable())
+        {
+            emit notice("Authentication temporarily unavailable; reconnecting automatically");
+            socket.abort();
+            return;
+        }
+        if (renew)
+        {
+            emit notice("Token refresh failed; reconnecting with the API credentials");
+            socket.abort();
+            return;
+        }
         // Authentication failures never log request parameters or secrets.
         emit notice("Authentication failed; check API key permissions and environment");
         wanted = false;

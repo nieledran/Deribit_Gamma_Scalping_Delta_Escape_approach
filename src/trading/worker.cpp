@@ -62,6 +62,7 @@ void TradingWorker::initialize()
                             [&]
                             {
                                 ++epoch;
+                                waitingData = requested != RunRequest::None;
                                 recovering = false;
                                 synced = false;
                                 syncing = false;
@@ -71,7 +72,11 @@ void TradingWorker::initialize()
                                 startPending = false;
                                 resettingProfile = false;
                                 engine.stop("Connection lost; reconciliation required");
-                                status = "Disconnected";
+                                status = waitingData ? "Reconnecting; auto-resume pending"
+                                                     : "Disconnected";
+                                log(waitingData ? "Connection lost; reconnecting automatically, "
+                                                  "then verifying orders before resuming"
+                                                : "Connection lost; reconnecting automatically");
                                 save();
                                 publish();
                             });
@@ -112,6 +117,9 @@ void TradingWorker::log(const QString& text, const QJsonObject& details)
 }
 void TradingWorker::fail(const QString& reason)
 {
+    requested = RunRequest::None;
+    waitingData = false;
+    retryAt = 0;
     if (resettingProfile)
     {
         ++epoch;
@@ -171,8 +179,9 @@ void TradingWorker::publish()
     s.connected = client && client->authenticated();
     s.synced = synced;
     s.running = engine.running;
-    s.busy = busy || startPending;
+    s.busy = busy || startPending || (waitingData && requested != RunRequest::None) || recovering;
     s.anchored = engine.anchored;
+    s.executing = engine.active || recovering;
     s.inventory = engine.inventory;
     s.externalPosition = externalPosition;
     s.positionMismatch = positionAt > 0 && engine.spec.step > 0 &&
@@ -200,7 +209,8 @@ void TradingWorker::publish()
         s.target = engine.active ? engine.operation.target : engine.target();
     }
     s.canDelete = s.connected && accountLock && accountLock->isLocked() && !account.isEmpty() &&
-                  !syncing && !busy && !startPending && !engine.running && !storageFailed;
+                  !syncing && !recovering && requested == RunRequest::None && !busy &&
+                  !startPending && !engine.running && !storageFailed;
     if (client)
     {
         const auto connection = client->connectionStatus();
@@ -229,6 +239,7 @@ void TradingWorker::shutdown()
     if (marketTimer)
         marketTimer->stop();
     startPending = false;
+    requested = RunRequest::None;
     guard(
         [&]
         {

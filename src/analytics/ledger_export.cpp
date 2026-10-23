@@ -1,12 +1,12 @@
 #include "analytics/ledger.h"
 #include <QDir>
 #include <QJsonDocument>
-#include <QSaveFile>
 #include <QMap>
-#include <QTimeZone>
+#include <QSaveFile>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QSqlRecord>
+#include <QTimeZone>
 #include <algorithm>
 namespace scalper
 {
@@ -241,7 +241,8 @@ QString Ledger::exportCsv(const QString& dir)
         };
         QMap<QString, Day> days;
         QSqlQuery samples(db);
-        if (!samples.exec("SELECT at,construction,pnl,complete FROM samples ORDER BY construction,at"))
+        if (!samples.exec("SELECT at,construction,pnl,complete,snapshot FROM samples ORDER BY "
+                          "construction,at"))
             throw std::runtime_error("Cannot read daily valuations");
         QString previousConstruction;
         qint64 previousAt = 0;
@@ -252,7 +253,19 @@ QString Ledger::exportCsv(const QString& dir)
                 continue; // Preserve legacy raw exports without inventing a new start.
             const qint64 at = samples.value(0).toLongLong();
             const QString construction = samples.value(1).toString();
-            const QString date = QDateTime::fromMSecsSinceEpoch(at, QTimeZone::utc()).date().toString(Qt::ISODate);
+            Pnl recorded = Pnl::fromJson(data["construction_pnl"].toObject());
+            bool covered = false;
+            const auto baseline = metadata("pnl_start/" + construction);
+            if (!baseline.isEmpty())
+            {
+                // Backfilled/corrected history must rebase daily results as well as the live UI.
+                const auto current = value(restoreSnapshot(object(samples.value(4).toString())));
+                const auto start = value(restoreSnapshot(baseline));
+                recorded = current.pnl - start.pnl;
+                covered = current.complete && start.complete;
+            }
+            const QString date =
+                QDateTime::fromMSecsSinceEpoch(at, QTimeZone::utc()).date().toString(Qt::ISODate);
             auto& day = days[construction + "/" + date];
             if (!day.first)
             {
@@ -260,15 +273,17 @@ QString Ledger::exportCsv(const QString& dir)
                 day.date = date;
                 day.first = at;
                 day.started = data["started_at"].toInteger();
-                day.opening = Pnl::fromJson(data["construction_pnl"].toObject());
-                const qint64 midnight = QDateTime(QDate::fromString(date, Qt::ISODate), QTime(0, 0), QTimeZone::utc()).toMSecsSinceEpoch();
+                day.opening = recorded;
+                const qint64 midnight =
+                    QDateTime(QDate::fromString(date, Qt::ISODate), QTime(0, 0), QTimeZone::utc())
+                        .toMSecsSinceEpoch();
                 day.complete = at - std::max(midnight, day.started) <= 2000;
             }
             if (previousConstruction == construction && at - previousAt > Time::MarketDataMaxAgeMs)
                 day.complete = false;
             day.last = at;
-            day.closing = Pnl::fromJson(data["construction_pnl"].toObject());
-            day.complete = day.complete && samples.value(3).toBool();
+            day.closing = recorded;
+            day.complete = day.complete && covered;
             previousAt = at;
             previousConstruction = construction;
         }
@@ -276,16 +291,25 @@ QString Ledger::exportCsv(const QString& dir)
         if (!daily.open(QIODevice::WriteOnly))
             throw std::runtime_error("Cannot write daily CSV");
         daily.write("\xEF\xBB\xBF");
-        daily.write("Date UTC,Construction,From UTC,To UTC,Options,Hedge realized,Hedge unrealized,Fees,Funding,Net P&L,Coverage\r\n");
+        daily.write("Date UTC,Construction,From UTC,To UTC,Options,Hedge realized,Hedge "
+                    "unrealized,Fees,Funding,Net P&L,Coverage\r\n");
         for (const auto& day : days)
         {
             const auto pnl = day.closing - day.opening;
-            const qint64 next = QDateTime(QDate::fromString(day.date, Qt::ISODate).addDays(1), QTime(0, 0), QTimeZone::utc()).toMSecsSinceEpoch();
+            const qint64 next = QDateTime(QDate::fromString(day.date, Qt::ISODate).addDays(1),
+                                          QTime(0, 0), QTimeZone::utc())
+                                    .toMSecsSinceEpoch();
             const bool complete = day.complete && next - day.last <= 2000;
-            QStringList row{day.date, day.construction, isoUtc(day.first), isoUtc(day.last),
-                            QString::number(pnl.options, 'g', 17), QString::number(pnl.realized, 'g', 17),
-                            QString::number(pnl.unrealized, 'g', 17), QString::number(pnl.optionFees + pnl.hedgeFees, 'g', 17),
-                            QString::number(pnl.funding, 'g', 17), QString::number(pnl.net(), 'g', 17),
+            QStringList row{day.date,
+                            day.construction,
+                            isoUtc(day.first),
+                            isoUtc(day.last),
+                            QString::number(pnl.options, 'g', 17),
+                            QString::number(pnl.realized, 'g', 17),
+                            QString::number(pnl.unrealized, 'g', 17),
+                            QString::number(pnl.optionFees + pnl.hedgeFees, 'g', 17),
+                            QString::number(pnl.funding, 'g', 17),
+                            QString::number(pnl.net(), 'g', 17),
                             complete ? "Complete recorded period" : "Partial recorded period"};
             for (auto& cell : row)
                 cell = csvCell(cell);

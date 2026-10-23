@@ -67,9 +67,31 @@ class CoreTests : public QObject
         old["execution"] = int(Execution::PostOnly);
         QCOMPARE(Config::fromJson(old).execution, Execution::PostOnly);
         QVERIFY(!old.contains("max_notional"));
+        auto legacy = e.json();
+        auto legacyConfig = e.config.json();
+        legacyConfig.remove("hedge_percent");
+        legacyConfig["max_notional"] = 1000;
+        legacy["config"] = legacyConfig;
+        legacy["anchored"] = true;
+        legacy["inventory"] = -.01;
+        Hedger restored;
+        restored.restore(legacy);
+        QVERIFY(!restored.anchored);
+        QCOMPARE(restored.inventory, -.01);
         e.config.hedgePercent = 50;
         e.options[0].delta = .501;
         QCOMPARE(e.target(), -.025);
+    }
+    void minimumDeltaChangeIncludesCoverage()
+    {
+        auto e = fixtures::engine(1000000000);
+        e.config.deltaChange = .001;
+        e.config.hedgePercent = 50;
+        QVERIFY(!e.start(1000000000));
+        e.config.hedgePercent = 200;
+        QVERIFY(e.start(1000000000));
+        e.config.hedgePercent = 0;
+        QVERIFY(!e.config.validate().isEmpty());
     }
     void completionKeepsUnhedgedDrift()
     {
@@ -254,6 +276,35 @@ class CoreTests : public QObject
         QVERIFY(*b < 100000);
         c.quantity = 0;
         QVERIFY(!escapePrice({c}, 0, .04, 100000, t, true));
+    }
+    void localMoveEstimates()
+    {
+        const qint64 now = 1000000000;
+        const auto call = fixtures::option(now, true, false, .2);
+        auto put = fixtures::option(now, false, false, -.1);
+        const auto g = aggregate({call, put});
+        const auto moves = estimateMoves(g, 100000, .01);
+        QVERIFY(moves.rebalancePercent && moves.breakEven);
+        QVERIFY(std::abs(*moves.rebalancePercent - 1.2) < 1e-10);
+        // Gamma profit at this move exactly offsets the supplied signed theta.
+        QVERIFY(std::abs(.5 * g.gamma * std::pow(*moves.breakEven, 2) + g.theta) < 1e-10);
+        const auto halfBand = estimateMoves(g, 100000, .005);
+        QVERIFY(std::abs(*halfBand.rebalancePercent - .6) < 1e-10);
+        QCOMPARE(*halfBand.breakEven, *moves.breakEven);
+        put.quantity = -.2;
+        const auto flat = estimateMoves(aggregate({call, put}), 100000, .01);
+        QVERIFY(!flat.rebalancePercent && !flat.breakEven);
+        put.quantity = -.3;
+        const auto shortGamma = estimateMoves(aggregate({call, put}), 100000, .01);
+        QVERIFY(shortGamma.rebalancePercent);
+        QVERIFY(!shortGamma.breakEven);
+        auto invalid = g;
+        invalid.theta = 10;
+        QVERIFY(!estimateMoves(invalid, 100000, .01).breakEven);
+        invalid.gamma = std::numeric_limits<double>::quiet_NaN();
+        QVERIFY(!estimateMoves(invalid, 100000, .01).rebalancePercent);
+        QVERIFY(!estimateMoves(invalid, 100000, .01).breakEven);
+        QVERIFY(!estimateMoves(g, 0, .01).rebalancePercent);
     }
 };
 QTEST_GUILESS_MAIN(CoreTests)

@@ -231,7 +231,7 @@ class LedgerTests : public QObject
         QCOMPARE(v.pnl.hedgeFees, .5);
         QCOMPARE(v.pnl.net(), 1.0);
     }
-    void sessionRebasesWhenHistoryArrives()
+    void constructionPnlRebasesWhenHistoryArrives()
     {
         QTemporaryDir d;
         QVERIFY(d.isValid());
@@ -450,6 +450,52 @@ class LedgerTests : public QObject
                                  {"type", "expiry"},
                                  {"cashflow", 0.0}});
         compare(s);
+    }
+    void dailyCsvUsesRecordedConstructionPnlAndMarksGaps()
+    {
+        QTemporaryDir d;
+        Store core(d.filePath("core.db"));
+        Ledger l(d.filePath("core.db"), d.filePath("analytics.db"));
+        const qint64 t =
+            QDateTime(QDate(2026, 10, 23), QTime(9, 0), QTimeZone::utc()).toMSecsSinceEpoch();
+        auto s = snap(t);
+        l.ensureLegs(s);
+        l.logEntry("BTC", optionTrade(s.positions[0], 1, t - 1000, .1, .1, .05));
+        l.finishImport(s.constructionId, s.positions[0]);
+        core.metadata("pnl_start/" + s.constructionId, Ledger::valuationSnapshot(s));
+        QCOMPARE(l.report(s).pnl.net(), 0.0);
+        s.timestamp += 1000;
+        s.positions[0].mark += .001;
+        auto a = l.report(s);
+        l.sample(s, l.value(s), &a);
+        s.timestamp += 60000; // Missing observations must remain visibly partial.
+        s.positions[0].mark += .001;
+        a = l.report(s);
+        l.sample(s, l.value(s), &a);
+        s.timestamp =
+            QDateTime(QDate(2026, 10, 24), QTime(0, 0), QTimeZone::utc()).toMSecsSinceEpoch();
+        a = l.report(s);
+        l.sample(s, l.value(s), &a);
+        // History arriving after samples were saved must also correct the daily export.
+        auto sell = optionTrade(s.positions[0], 2, t + 1000, -.001, .099, .06);
+        sell["commission"] = .00001;
+        auto buy = optionTrade(s.positions[0], 3, t + 1000, .001, .1, .06);
+        buy["commission"] = .00001;
+        l.logEntry("BTC", sell);
+        l.logEntry("BTC", buy);
+        const auto folder = l.exportCsv(d.filePath("exports"));
+        QFile daily(folder + "/daily.csv");
+        QVERIFY(daily.open(QIODevice::ReadOnly));
+        const auto text = daily.readAll();
+        QVERIFY(text.startsWith("\xEF\xBB\xBF"));
+        QVERIFY(text.contains("2026-10-23"));
+        QVERIFY(text.contains("2026-10-24"));
+        const auto firstDay = QString::fromUtf8(text).split('\n').at(1).split(',');
+        QVERIFY(std::abs(QString(firstDay.at(9)).remove('"').toDouble() - 18) < 1e-7);
+        QVERIFY(text.contains("Partial recorded period"));
+        QVERIFY(!text.contains("Complete recorded period"));
+        QVERIFY(QFile::exists(folder + "/trades.csv"));
+        QVERIFY(QFile::exists(folder + "/sessions.csv")); // Legacy raw history remains exportable.
     }
     void resetAndExport()
     {

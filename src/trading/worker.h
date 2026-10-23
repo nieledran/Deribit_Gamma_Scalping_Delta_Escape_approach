@@ -56,7 +56,15 @@ class TradingWorker : public QObject
     bool selectionReview = false;
     bool refreshingMarket = false, startPending = false;
     bool resettingProfile = false;
-    bool recovering = false, recoveryRunning = false, recoveryClose = false;
+    bool recovering = false, waitingData = false;
+    enum class RunRequest
+    {
+        None,
+        Hedge,
+        Close
+    };
+    RunRequest requested = RunRequest::None;
+    qint64 retryAt = 0;
     int recoveryChecks = 0;
     qint64 recoveryReadyAt = 0;
     double externalPosition = 0;
@@ -94,6 +102,9 @@ class TradingWorker : public QObject
     void pruneClosedOptions();
     void refreshMarketData(QStringList names, std::function<void(bool)> done);
     void refreshQuietMarkets();
+    void waitForData(const QString& reason);
+    bool resumeRequested();
+    bool acceptRead(const RpcResult& result, const QString& context);
     QStringList marketInstruments(bool onlyStale) const;
     void completeStart();
     void validateStart();

@@ -117,7 +117,8 @@ struct Margin
 struct Order
 {
     QString label, id, instrument, state = "open";
-    bool buy = false, postOnly = true, ioc = false, reduceOnly = false, terminal = false, uncertain = false;
+    bool buy = false, postOnly = true, ioc = false, reduceOnly = false, terminal = false,
+         uncertain = false;
     double price = 0, total = 0, filled = 0;
     qint64 updated = 0, attemptAt = 0, createdAt = 0;
     QString mutation;
@@ -133,7 +134,7 @@ struct TradingSnapshot
     QString connectionStatus = "Disconnected";
     bool connectionSlow = false;
     bool connected = false, synced = false, running = false, busy = false, canDelete = false;
-    bool anchored = false;
+    bool anchored = false, executing = false;
     bool positionMismatch = false;
     double externalPosition = 0;
     qint64 timestamp = 0, cooldownUntil = 0, latencyMs = -1;
@@ -198,8 +199,7 @@ struct AnalyticsSnapshot
     QString constructionId;
     quint64 revision = 0;
     qint64 timestamp = 0, startedAt = 0;
-    QString completeness = "Waiting for fresh prices and selected option data",
-                       historyStatus;
+    QString completeness = "Waiting for fresh prices and selected option data", historyStatus;
     Pnl pnl;
     bool complete = false, ready = false;
     QString message;

@@ -178,6 +178,7 @@ class ClientTests : public QObject
         QVERIFY(server.listen(QHostAddress::LocalHost, 0));
         Client client;
         QSignalSpy authenticated(&client, &Client::authenticatedSession);
+        QSignalSpy pacing(&client, &Client::notice);
         QList<qint64> times;
         QElapsedTimer elapsed;
         elapsed.start();
@@ -214,7 +215,9 @@ class ClientTests : public QObject
         client.setTradingLimits(
             {{"limits_per_currency", perCurrency},
              {"matching_engine", perCurrency ? QJsonObject{{"usdc", trading}} : trading}});
-        for (int i = 0; i < 3; ++i)
+        QVERIFY(!pacing.isEmpty());
+        QVERIFY(pacing.last().first().toString().contains("4.0 requests/s"));
+        for (int i = 0; i < 10; ++i)
             client.call(
                 "private/buy", {},
                 [&](const RpcResult& r)
@@ -224,11 +227,14 @@ class ClientTests : public QObject
                     QVERIFY(!r.ok);
                 },
                 true);
-        QTRY_COMPARE(completed, 3);
+        QTRY_COMPARE_WITH_TIMEOUT(completed, 10, 6000);
         QVERIFY(!uncertain);
-        QCOMPARE(times.size(), 3);
-        QVERIFY(times[1] - times[0] >= 470);
-        QVERIFY(times[2] - times[1] >= 470);
+        QCOMPARE(times.size(), 10);
+        // Receive times include event-loop/network jitter. Nine 250 ms intervals should
+        // span about 2250 ms; test sustained pacing, not individual packet-arrival gaps.
+        const auto span = times.last() - times.first();
+        QVERIFY2(span >= 2100 && span < 2750,
+                 qPrintable(QString("Ten-request arrival span: %1 ms").arg(span)));
         client.stop();
     }
 
