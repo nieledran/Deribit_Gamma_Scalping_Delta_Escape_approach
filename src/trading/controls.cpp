@@ -55,6 +55,7 @@ void TradingWorker::applyConfig(Config c)
                 engine.active = false;
             }
             engine.config = c;
+            client->setTradingIntervalMs(c.tradingIntervalMs);
             updateSelected();
             engine.problem.clear();
             save();
@@ -141,6 +142,9 @@ void TradingWorker::completeStart()
             retryAt = 0;
             attempts = 0;
             status = "Running";
+            passiveSince = 0;
+            passiveAlerted = false;
+            hedgeAlert.clear();
             save();
             log("Trading started");
             pump();
@@ -157,6 +161,9 @@ void TradingWorker::stopTrading()
             retryAt = 0;
             engine.stop();
             desiredClose = false;
+            passiveSince = 0;
+            passiveAlerted = false;
+            hedgeAlert.clear();
             status = "Paused";
             if (requestId)
                 client->cancelQueued(requestId);

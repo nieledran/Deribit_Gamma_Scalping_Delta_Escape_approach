@@ -69,11 +69,13 @@ class TradingWorker : public QObject
     qint64 recoveryReadyAt = 0;
     double externalPosition = 0;
     qint64 requestId = 0, lastFill = 0, positionAt = 0;
-    QElapsedTimer hedgeElapsed;
+    qint64 passiveSince = 0;
+    QString hedgeAlert;
+    bool passiveAlerted = false;
     qint64 lastHedgeMs = -1;
     std::optional<qint64> exchangeClockOffsetMs;
-    double actualPosition = 0, liquidation = 0, makerFee = Exchange::DefaultMakerFee,
-           takerFee = Exchange::DefaultTakerFee;
+    double actualPosition = 0, liquidation = 0;
+    std::optional<double> accountMakerFee, accountTakerFee;
     double sessionFunding = 0, fundingBaseline = 0;
     qint64 fundingAt = 0, fundingBaselineSession = 0;
     bool fundingValid = false;
@@ -115,12 +117,12 @@ class TradingWorker : public QObject
     Order* findOrder(const QString& label, const QString& id = {});
     bool owns(const Order& order) const;
     void execute(QString method, QJsonObject params, Order& order);
-    void submitNew(bool aggressive);
-    void editOrder(Order& order, bool aggressive);
+    void submitNew(const HedgeQuote& quote);
+    void editOrder(Order& order, const HedgeQuote& quote);
+    bool quoteCurrent(const HedgeQuote& quote, quint64 revision);
     void cancelOrder(Order& order);
     void preflight(std::function<void()> action, double amount, double price, bool buy,
                    bool reducing);
-    void finishOperation();
     double expectedPosition() const
     {
         return externalPosition + engine.inventory;

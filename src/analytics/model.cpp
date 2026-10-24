@@ -23,6 +23,51 @@ static double cdf(double x)
 {
     return .5 * std::erfc(-x / std::numbers::sqrt2);
 }
+double projectedDelta(const QVector<Option>& options, double index, qint64 now)
+{
+    double delta = 0;
+    for (const auto& o : options)
+        delta += o.quantity * (o.delta + optionModel(o, index, now).delta -
+                               optionModel(o, o.index, now).delta);
+    return delta;
+}
+std::optional<double> deltaLevel(const QVector<Option>& options, double normalized,
+                                 const Quote& quote, qint64 now, bool above)
+{
+    const double gross = aggregate(options).gross;
+    if (gross <= Epsilon || quote.index <= 0 || !std::isfinite(quote.index))
+        return {};
+    const double basis = quote.mid() - quote.index;
+    auto f = [&](double index) { return projectedDelta(options, index, now) / gross - normalized; };
+    double last = quote.index, previous = f(last);
+    if (std::abs(previous) < 1e-12)
+        return quote.mid();
+    double move = 0, step = .00001;
+    for (int i = 0; i < 1600 && move < 12; ++i)
+    {
+        move += step;
+        step = std::min(.025, step * 1.06);
+        double next = quote.index * std::exp(above ? move : -move);
+        const double value = f(next);
+        if (value * previous <= 0)
+        {
+            double lo = last, hi = next;
+            for (int n = 0; n < 45; ++n)
+            {
+                const double mid = (lo + hi) / 2;
+                if (f(mid) * previous > 0)
+                    lo = mid;
+                else
+                    hi = mid;
+            }
+            const double price = (lo + hi) / 2 + basis;
+            return price > 0 ? std::optional<double>(price) : std::nullopt;
+        }
+        last = next;
+        previous = value;
+    }
+    return {};
+}
 ModelValue optionModel(const Option& o, double spot, qint64 now)
 {
     if (spot <= 0 || o.index <= 0 || o.spec.strike <= 0)

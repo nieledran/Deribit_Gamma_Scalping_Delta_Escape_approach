@@ -193,6 +193,7 @@ void TradingWorker::finishProfileReset()
                         throw;
                     }
                     engine = std::move(fresh);
+                    client->setTradingIntervalMs(engine.config.tradingIntervalMs);
                     construction = nextConstruction;
                     externalPosition = actualPosition = remaining;
                     positionAt = utcNow();

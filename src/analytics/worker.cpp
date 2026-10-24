@@ -153,10 +153,16 @@ void AnalyticsWorker::requestRisk(RiskRequest request)
         result.deltaChange = s.config.deltaChange;
         for (const auto& option : selected)
             result.impliedVols.append({option.spec.name, option.iv});
-        result.lower =
-            escapePrice(selected, reference, s.config.deltaChange, result.spot, s.timestamp, false);
-        result.upper =
-            escapePrice(selected, reference, s.config.deltaChange, result.spot, s.timestamp, true);
+        result.lower = s.hedgeQuotes.buy.enabled ? std::optional<double>(s.hedgeQuotes.buy.price) : std::nullopt;
+        result.upper = s.hedgeQuotes.sell.enabled ? std::optional<double>(s.hedgeQuotes.sell.price) : std::nullopt;
+        for (const auto& order : s.orders)
+            if (!order.terminal && !order.uncertain)
+            {
+                if (order.role == s.hedgeQuotes.buy.role && s.hedgeQuotes.buy.enabled)
+                    result.lower = order.price;
+                if (order.role == s.hedgeQuotes.sell.role && s.hedgeQuotes.sell.enabled)
+                    result.upper = order.price;
+            }
     }
     catch (const std::exception& e)
     {

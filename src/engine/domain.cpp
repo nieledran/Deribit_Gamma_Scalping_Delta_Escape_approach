@@ -38,12 +38,6 @@ double tickPrice(double value, double tick, bool up)
         throw std::runtime_error("Invalid limit price or tick");
     return (up ? std::ceil(value / tick - 1e-8) : std::floor(value / tick + 1e-8)) * tick;
 }
-QString executionName(Execution m)
-{
-    return m == Execution::PostOnly   ? "POST-ONLY"
-           : m == Execution::Balanced ? "Balanced"
-                                      : "Aggressive";
-}
 QString Config::validate() const
 {
     if (!Exchange::supportedHedge(instrument))
@@ -56,15 +50,12 @@ QString Config::validate() const
     if (marginLimitEnabled &&
         (!std::isfinite(maxMarginUsage) || maxMarginUsage <= 0 || maxMarginUsage >= 1))
         return "Set Max Margin Usage between 0 and 100% (exclusive)";
-    if (!std::isfinite(slippageBps) || slippageBps <= 0 || slippageBps > Limits::MaxSlippageBps)
-        return QString("Slippage limit must be greater than 0 and no greater than %1 bps")
-            .arg(Limits::MaxSlippageBps);
-    if (cooldownMs < Limits::MinOperationIntervalMs || cooldownMs > Limits::MaxCooldownMs ||
-        makerWaitMs < Limits::MinOperationIntervalMs || makerWaitMs > Limits::MaxMakerWaitMs)
-        return "Invalid cooldown or maker attempt duration";
-    if (balancedPassiveAttempts < 1 || balancedPassiveAttempts > Limits::MaxPassiveAttempts ||
-        aggressivePassiveAttempts < 1 || aggressivePassiveAttempts > Limits::MaxPassiveAttempts)
-        return QString("Passive attempts must be between 1 and %1").arg(Limits::MaxPassiveAttempts);
+    if (tradingIntervalMs < Limits::MinTradingIntervalMs ||
+        tradingIntervalMs > Limits::MaxTradingIntervalMs)
+        return "Trading-request spacing must be between 100 and 60000 ms";
+    if (!std::isfinite(fallbackMakerFee) || fallbackMakerFee < -1 || fallbackMakerFee > 1 ||
+        !std::isfinite(fallbackTakerFee) || fallbackTakerFee < 0 || fallbackTakerFee > 1)
+        return "Fallback maker fee must be between -100% and 100%; taker fee between 0% and 100%";
     if (selected.isEmpty())
         return "Select at least one open option position";
     return {};
@@ -78,12 +69,9 @@ QJsonObject Config::json() const
             {"hedge_percent", hedgePercent},
             {"max_margin_usage", maxMarginUsage},
             {"margin_limit_enabled", marginLimitEnabled},
-            {"slippage_bps", slippageBps},
-            {"cooldown_ms", cooldownMs},
-            {"maker_wait_ms", makerWaitMs},
-            {"balanced_passive_attempts", balancedPassiveAttempts},
-            {"aggressive_passive_attempts", aggressivePassiveAttempts},
-            {"execution", int(execution)}};
+            {"trading_interval_ms", tradingIntervalMs},
+            {"fallback_maker_fee", fallbackMakerFee},
+            {"fallback_taker_fee", fallbackTakerFee}};
 }
 Config Config::fromJson(const QJsonObject& j)
 {
@@ -96,17 +84,9 @@ Config Config::fromJson(const QJsonObject& j)
     c.hedgePercent = j["hedge_percent"].toDouble(c.hedgePercent);
     c.maxMarginUsage = j["max_margin_usage"].toDouble(c.maxMarginUsage);
     c.marginLimitEnabled = j["margin_limit_enabled"].toBool(c.maxMarginUsage > 0);
-    c.slippageBps = j["slippage_bps"].toDouble(c.slippageBps);
-    c.cooldownMs = j["cooldown_ms"].toInt(c.cooldownMs);
-    c.makerWaitMs = j["maker_wait_ms"].toInt(c.makerWaitMs);
-    c.balancedPassiveAttempts = j["balanced_passive_attempts"].toInt(c.balancedPassiveAttempts);
-    c.aggressivePassiveAttempts = j["aggressive_passive_attempts"].toInt(c.aggressivePassiveAttempts);
-    // Old profiles migrate once to ordinary limit execution.
-    int m = j.contains("hedge_percent") ? j["execution"].toInt(int(c.execution))
-                                        : int(Execution::Balanced);
-    if (m < int(Execution::PostOnly) || m > int(Execution::Aggressive))
-        throw std::runtime_error("Invalid saved execution mode");
-    c.execution = Execution(m);
+    c.tradingIntervalMs = j["trading_interval_ms"].toInt(c.tradingIntervalMs);
+    c.fallbackMakerFee = j["fallback_maker_fee"].toDouble(c.fallbackMakerFee);
+    c.fallbackTakerFee = j["fallback_taker_fee"].toDouble(c.fallbackTakerFee);
     return c;
 }
 double Instrument::tickAt(double p) const
@@ -244,6 +224,7 @@ Margin Margin::parse(const QJsonObject& j, qint64 now)
 QJsonObject Order::json() const
 {
     return {{"label", label},           {"id", id},
+            {"role", role},             {"target", target},
             {"instrument", instrument}, {"buy", buy},
             {"post_only", postOnly},    {"ioc", ioc},
             {"state", state},           {"reduce_only", reduceOnly},
@@ -256,6 +237,8 @@ QJsonObject Order::json() const
 Order Order::fromJson(const QJsonObject& j)
 {
     Order o;
+    o.role = j["role"].toString("legacy");
+    o.target = j["target"].toDouble();
     o.label = j["label"].toString();
     o.id = j["id"].toString();
     o.instrument = j["instrument"].toString();

@@ -64,7 +64,7 @@ if(BUILD_TESTING)
   target_link_libraries(runtime_tests PRIVATE gamma_ui Qt6::Test)
   add_test(NAME execution_and_ui COMMAND runtime_tests -platform offscreen
     -o "${CMAKE_CURRENT_BINARY_DIR}/runtime-tests.txt,txt")
-  set_tests_properties(execution_and_ui PROPERTIES TIMEOUT 300)
+  set_tests_properties(execution_and_ui PROPERTIES TIMEOUT 480)
   qt_add_executable(performance_tests tests/performance_tests.cpp)
   target_link_libraries(performance_tests PRIVATE gamma_ui Qt6::Test)
   add_test(NAME offline_performance COMMAND performance_tests -platform offscreen

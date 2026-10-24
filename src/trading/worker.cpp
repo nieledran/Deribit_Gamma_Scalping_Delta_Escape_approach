@@ -1,4 +1,5 @@
 #include "trading/worker.h"
+#include "analytics/model.h"
 #include <QDir>
 #include <QFileInfo>
 #include <QUuid>
@@ -51,6 +52,7 @@ void TradingWorker::initialize()
             for (auto o : engine.options)
                 positions[o.spec.name] = o;
             client = new Client(this);
+            client->setTradingIntervalMs(engine.config.tradingIntervalMs);
             connect(client, &Client::notice, this,
                     [this](const QString& text) { guard([&] { log(text); }); });
             connect(client, &Client::authenticatedSession, this,
@@ -187,14 +189,25 @@ void TradingWorker::publish()
     s.positionMismatch = positionAt > 0 && engine.spec.step > 0 &&
                          std::abs(actualPosition - expectedPosition()) > engine.spec.step * .1;
     s.referenceDelta = engine.referenceDelta;
-    s.cooldownUntil = engine.completedAt + engine.config.cooldownMs;
+    s.strategy = engine.state;
+    s.hedgeQuotes = engine.quotes;
+    if (engine.quote.index > 0 && !engine.options.isEmpty())
+    {
+        const auto greeks = aggregate(engine.options);
+        const double delta = projectedDelta(engine.options, engine.quote.index, s.timestamp);
+        s.hedgeQuotes.normalized = greeks.gross > Epsilon ? delta / greeks.gross : 0;
+        s.hedgeQuotes.error = engine.inventory + delta * engine.config.hedgePercent / 100;
+        if (std::abs(s.hedgeQuotes.error) < Epsilon)
+            s.hedgeQuotes.error = 0;
+    }
+    s.hedgeAlert = hedgeAlert;
     s.quote = engine.quote;
     s.margin = engine.margin;
     s.orders = orders;
     s.messages = messages;
     s.liquidation = liquidation;
-    s.makerFee = makerFee;
-    s.takerFee = takerFee;
+    s.makerFee = accountMakerFee.value_or(engine.config.fallbackMakerFee);
+    s.takerFee = accountTakerFee.value_or(engine.config.fallbackTakerFee);
     s.sessionFunding = sessionFunding;
     s.fundingBaseline = fundingBaseline;
     s.fundingAt = fundingAt;

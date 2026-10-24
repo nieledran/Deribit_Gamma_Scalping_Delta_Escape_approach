@@ -62,6 +62,7 @@ class Client : public QObject
 
     ConnectionStatus connectionStatus() const;
     void setTradingLimits(const QJsonObject& limits);
+    void setTradingIntervalMs(int milliseconds);
   signals:
     void authenticatedSession(const QJsonObject& auth);
     void lost();
@@ -95,6 +96,7 @@ class Client : public QObject
     qint64 lastLatency = -1, connectionStarted = 0;
     qint64 lastQueueDelay = -1;
     int mutationInterval = MinimumTradingIntervalMs;
+    int configuredTradingInterval = MinimumTradingIntervalMs, accountTradingInterval = 0;
     int retryMs = InitialRetryMs;
     bool wanted = false, authorized = false;
     bool connectionFailed = false;
@@ -104,4 +106,5 @@ class Client : public QObject
     void receive(const QString& message);
     void disconnected();
     void sendNext();
+    void updateTradingPacing();
 };

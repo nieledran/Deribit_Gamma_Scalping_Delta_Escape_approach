@@ -113,15 +113,12 @@ void Window::setupUi()
         return box;
     };
     band = spin("Delta Change", Limits::MaxDeltaChange, 5, defaults.deltaChange, "deltaChange");
-    band->setToolTip("Change in normalized option delta since the last completed hedge.\n"
+    band->setToolTip("Normalized option delta tolerance around confirmed hedge inventory.\n"
                      "0.50 to 0.54 = 0.04 points. Both straddle legs count in gross quantity.");
     coverage = spin("Delta coverage (%)", 1000000, 2, defaults.hedgePercent, "hedgePercent");
     coverage->setMinimum(.01);
     coverage->setToolTip(
         "Target perpetual = -option delta x coverage / 100. 200% hedges twice the delta.");
-    cooldown = spin("Cooldown (s)", double(Limits::MaxCooldownMs) / 1000, 1,
-                    defaults.cooldownMs / 1000.0, "cooldown");
-    cooldown->setMinimum(.5);
     auto* advanced = new QPushButton("Advanced");
     alignButton(advanced);
     advanced->setObjectName("advanced");
@@ -251,18 +248,21 @@ void Window::setupUi()
     auto* quotes = new QGridLayout(marketPanel);
     quotes->setContentsMargins(8, 4, 8, 4);
     // Fixed column proportions: text changes never resize neighbouring fields.
-    const int quoteWidths[] = {105, 105, 158};
-    for (int col = 0; col < 3; ++col)
+    const int quoteWidths[] = {180, 120, 120, 200, 220};
+    for (int col = 0; col < 5; ++col)
         quotes->setColumnStretch(col, quoteWidths[col]);
+    rebalanceBand = new StableLabel;
+    rebalanceBand->setObjectName("rebalanceBand");
+    quotes->addWidget(rebalanceBand, 0, 0);
     risk = new StableLabel;
     risk->setObjectName("riskSummary");
-    quotes->addWidget(risk, 0, 2);
+    quotes->addWidget(risk, 0, 3);
     bidQuote = new QuoteLabel("Bid", QColor("#319263"));
     bidQuote->setObjectName("bidQuote");
     askQuote = new QuoteLabel("Ask", QColor("#c64c55"));
     askQuote->setObjectName("askQuote");
-    quotes->addWidget(bidQuote, 0, 0);
-    quotes->addWidget(askQuote, 0, 1);
+    quotes->addWidget(bidQuote, 0, 1);
+    quotes->addWidget(askQuote, 0, 2);
     layout->addWidget(marketPanel);
     auto* metrics = new QHBoxLayout;
     metrics->setSpacing(3);
@@ -298,18 +298,19 @@ void Window::setupUi()
     hedgeRemaining = metric(hedgeFields, 2, "hedgeRemaining");
     legsValue = metric(hedgeFields, 3, "legsValue");
     auto* stateRow = new QGridLayout;
-    stateRow->setColumnStretch(0, 1);
-    stateRow->setColumnStretch(1, 2);
+    stateRow->setColumnStretch(0, 2);
+    stateRow->setColumnStretch(1, 3);
     estimate = new StableLabel;
     estimate->setObjectName("hedgeEstimate");
     executionState = new StableLabel;
     executionState->setObjectName("executionState");
     stateRow->addWidget(estimate, 0, 0);
     stateRow->addWidget(executionState, 0, 1);
-    executionFields->addLayout(stateRow, 0, 0);
-    activity = metric(executionFields, 1, "tradingActivity");
-    rebalanceBand = metric(executionFields, 2, "rebalanceBand");
-    breakEvenMove = metric(executionFields, 3, "breakEvenMove");
+    quotes->addLayout(stateRow, 0, 4);
+    activity = metric(executionFields, 0, "tradingActivity");
+    breakEvenMove = metric(executionFields, 1, "breakEvenMove");
+    buyLevel = metric(executionFields, 2, "buyHedgeLevel");
+    sellLevel = metric(executionFields, 3, "sellHedgeLevel");
     layout->addLayout(metrics);
     tabs = new QTabWidget;
     tabs->setObjectName("mainTabs");
@@ -433,34 +434,23 @@ void Window::setupDialogs()
         advanced->addRow(title, box);
         return box;
     };
-    execution = new QComboBox;
-    execution->setObjectName("executionMode");
-    execution->addItems({executionName(Execution::PostOnly), executionName(Execution::Balanced),
-                         executionName(Execution::Aggressive)});
-    advanced->addRow("Execution:", execution);
-    connect(execution, &QComboBox::currentIndexChanged, this, [this] { markDirty(); });
-    auto* attempts = new QStackedWidget;
-    attempts->setObjectName("passiveAttempts");
-    attempts->setToolTip("Number of passive attempts before switching to crossing limit IOC.\n"
-                         "Saved separately for Balanced and Aggressive. POST-ONLY stays passive.");
-    attempts->addWidget(new QLabel("Unlimited"));
-    auto attemptCount = [&](const char* name)
-    {
-        auto* box = new QSpinBox;
-        box->setObjectName(name);
-        box->setRange(1, Limits::MaxPassiveAttempts);
-        attempts->addWidget(box);
-        connect(box, qOverload<int>(&QSpinBox::valueChanged), this, [this] { markDirty(); });
-        return box;
-    };
-    balancedAttempts = attemptCount("balancedPassiveAttempts");
-    aggressiveAttempts = attemptCount("aggressivePassiveAttempts");
-    advanced->addRow("Passive attempts:", attempts);
-    connect(execution, &QComboBox::currentIndexChanged, attempts, &QStackedWidget::setCurrentIndex);
-    attempts->setCurrentIndex(execution->currentIndex());
-    makerWait =
-        add("Passive attempt (s):", .5, double(Limits::MaxMakerWaitMs) / 1000, 1, "makerWait");
-    slippage = add("Slippage limit (bps):", .01, Limits::MaxSlippageBps, 2, "slippage");
+    auto* policy = new QLabel("Long-gamma options strategy | Post-only GTC limits");
+    policy->setWordWrap(true);
+    policy->setObjectName("executionPolicy");
+    advanced->addRow(policy);
+    tradingSpacing = new QSpinBox;
+    tradingSpacing->setObjectName("tradingRequestSpacing");
+    tradingSpacing->setRange(Exchange::MinimumTradingIntervalMs, Limits::MaxTradingIntervalMs);
+    tradingSpacing->setToolTip("Minimum time between trading requests. Deribit's account rate "
+                               "limit can require a longer interval.");
+    advanced->addRow("Trading-request spacing (ms):", tradingSpacing);
+    connect(tradingSpacing, qOverload<int>(&QSpinBox::valueChanged), this, [this] { markDirty(); });
+    fallbackMaker = add("Fallback maker fee (%):", -100, 100, 4, "fallbackMakerFee");
+    fallbackTaker = add("Fallback taker fee (%):", 0, 100, 4, "fallbackTakerFee");
+    fallbackMaker->setToolTip("Maker commission estimate when account fee rates are unavailable. "
+                              "Negative values represent rebates. Account rates take precedence.");
+    fallbackTaker->setToolTip("Taker commission estimate when account fee rates are unavailable. "
+                              "Account rates take precedence.");
     marginEnabled = new QCheckBox("Stop at account MM usage");
     marginEnabled->setObjectName("marginLimitEnabled");
     advanced->addRow(marginEnabled);

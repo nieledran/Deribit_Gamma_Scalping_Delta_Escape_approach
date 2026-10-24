@@ -113,10 +113,8 @@ void Window::render()
             activityText = s.status;
         else if (s.busy || s.executing)
             activityText = "Executing";
-        else if (s.cooldownUntil > utcNow())
-            activityText = "Cooldown";
         else
-            activityText = "Waiting for escape";
+            activityText = strategyName(s.strategy);
     }
     const bool validPrice =
         s.quote.bid > 0 && s.quote.ask >= s.quote.bid && std::isfinite(s.quote.mid());
@@ -142,7 +140,7 @@ void Window::render()
         "Approximate price move from a hedge reference to the next Delta Change trigger, "
         "in either direction. Not the distance left from the current price.\n"
         "100 x Delta Change x gross option quantity / |net option gamma| / Middle Price.\n"
-        "Local constant-gamma estimate; time, IV changes and Cooldown can change the result. "
+        "Local constant-gamma estimate; time and IV changes can change the result. "
         "Coverage changes trade size, not this price threshold.\n";
     if (freshMetrics && moves.rebalancePercent)
     {
@@ -150,7 +148,7 @@ void Window::render()
         const double notional = quantity * s.quote.mid();
         bandDetails += QString("At this band: ~%1 %2 turnover ($%3); one-way commission "
                                "~$%4 maker / ~$%5 taker. Before lot rounding; excludes spread "
-                               "and slippage. Actual fills may mix both fee rates.")
+                               "and slippage. Strategy orders are post-only; historical fills may include taker fees.")
                            .arg(displayNumber(quantity), s.config.base(),
                                 displayNumber(notional, 2), displayNumber(notional * s.makerFee, 4),
                                 displayNumber(notional * s.takerFee, 4));
@@ -200,8 +198,7 @@ void Window::render()
                                     .arg(adjustment > 0 ? "BUY" : "SELL",
                                          displayNumber(std::abs(adjustment)), s.config.base()));
     hedgeRemaining->setToolTip(
-        "Target futures quantity minus actual quantity. A new hedge waits "
-        "for Delta Change and Cooldown; during execution this is the remaining quantity.");
+        "Target futures quantity minus actual quantity. Resting orders prepare both Delta Change levels.");
     label(targetDeltaValue,
           QString("Delta goal (%1%): %2 %3")
               .arg(displayNumber(s.config.hedgePercent, 2),
@@ -216,9 +213,30 @@ void Window::render()
                          .arg(s.config.selected.size())
                          .arg(std::abs(s.inventory) > Epsilon ? 1 : 0));
     label(executionState, activityText);
-    const qint64 cooldownLeft = s.running ? std::max<qint64>(0, s.cooldownUntil - now) : 0;
-    label(activity,
-          "Cooldown left: " + displayNumber(std::ceil(cooldownLeft / 100.0) / 10, 1) + " s");
+    executionState->setToolTip(activityText);
+    label(activity, s.hedgeAlert.isEmpty()
+                        ? QString("Hedge error: %1 %2").arg(displayNumber(s.hedgeQuotes.error), s.config.base())
+                        : s.hedgeAlert);
+    activity->setToolTip(s.hedgeAlert.isEmpty() ? "Long-gamma options strategy. Passive corrections alert after 30 seconds; no taker fallback." : s.hedgeAlert);
+    activity->setStyleSheet(s.hedgeAlert.isEmpty() ? QString() : QString(theme::AlertStyle));
+    auto quoteText = [&](HedgeQuote q, bool buy)
+    {
+        q.buy = buy;
+        QString state = q.enabled ? "preparing" : q.reason.isEmpty() ? "inactive" : q.reason;
+        for (const auto& order : s.orders)
+            if (!order.terminal && order.buy == q.buy)
+            {
+                state = order.uncertain ? "uncertain" : !order.mutation.isEmpty() ? order.mutation : order.state;
+                return QString("%1 @ %2 | %3 %4 | %5")
+                    .arg(q.buy ? "BUY" : "SELL", displayNumber(order.price, 2),
+                         displayNumber(std::max(0.0, order.total - order.filled)), s.config.base(), state);
+            }
+        return q.enabled ? QString("%1 @ %2 | %3 %4 | %5")
+            .arg(q.buy ? "BUY" : "SELL", displayNumber(q.price, 2), displayNumber(q.amount), s.config.base(), state)
+            : QString("%1: %2").arg(q.buy ? "BUY" : "SELL", state);
+    };
+    label(buyLevel, quoteText(s.hedgeQuotes.buy, true));
+    label(sellLevel, quoteText(s.hedgeQuotes.sell, false));
     const bool valued = a.ready && a.timestamp > 0 && a.constructionId == s.constructionId;
     const bool staleValuation = !demo && (!s.connected || !s.quote.fresh(now) ||
                                           now - a.timestamp > Time::MarketDataMaxAgeMs);

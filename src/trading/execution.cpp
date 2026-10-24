@@ -93,9 +93,10 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
         store->event("order_intent", {{"method", method},
                                       {"params", params},
                                       {"label", order.label},
-                                      {"target", engine.operation.target},
+                                      {"target", order.target},
                                       {"option_delta", aggregate(engine.options).delta}});
     QString label = order.label;
+    const quint64 intentRevision = positionRevision;
     int generation = epoch;
     requestId = client->call(
         method, params,
@@ -123,7 +124,7 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
                                          : "n/a")
                                 .arg(engine.spec.step, 0, 'g', 12)
                                 .arg(engine.inventory, 0, 'g', 12)
-                                .arg(engine.operation.target, 0, 'g', 12),
+                                .arg(o->target, 0, 'g', 12),
                             {{"method", method},
                              {"code", r.code},
                              {"reason", r.error},
@@ -131,7 +132,7 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
                              {"request", o->request},
                              {"step", engine.spec.step},
                              {"inventory", engine.inventory},
-                             {"target", engine.operation.target},
+                             {"target", o->target},
                              {"uncertain", r.uncertain}});
                         if (r.uncertain)
                         {
@@ -159,7 +160,7 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
                         }
                         if (r.code == 11054)
                         {
-                            ++attempts;
+                            retryAt = utcNow() + Exchange::MinimumTradingIntervalMs;
                             // A rejected post-only edit can cancel the resting order.
                             if (method == "private/edit")
                             {
@@ -196,134 +197,102 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
                     }
                     receiveOrder(j, true);
                     receiveTrades(root["trades"].toArray());
-                    if (!recovering && o->terminal && engine.active &&
-                        std::abs(engine.remaining()) < engine.spec.step * .5)
-                        finishOperation();
+
                 });
         },
         true, true,
-        [this, label, cancel, params]
+        [this, label, cancel, params, intentRevision]
         {
             if (cancel)
                 return true;
             auto* o = findOrder(label);
             if (!o || !engine.running || !synced || storageFailed || !engine.quote.fresh(utcNow()))
                 return false;
-            if (!o->reduceOnly && !engine.safety(utcNow()).isEmpty())
+            const bool reducing = params["reduce_only"].toBool();
+            if (!reducing && !engine.safety(utcNow()).isEmpty())
                 return false;
             double final =
                 engine.inventory +
                 (o->buy ? 1 : -1) * std::max(0.0, params["amount"].toDouble() - o->filled);
-            if (o->reduceOnly && (engine.inventory * (o->buy ? 1 : -1) >= 0 ||
+            if (reducing && (engine.inventory * (o->buy ? 1 : -1) >= 0 ||
                                   std::abs(final) > std::abs(engine.inventory) + Epsilon ||
                                   final * engine.inventory < -Epsilon))
                 return false;
-            const double mid = engine.quote.mid();
-            const double adverse = (o->buy ? 1 : -1) * (params["price"].toDouble() - mid);
-            if (adverse / mid * Limits::BasisPoints > engine.config.slippageBps)
+            const HedgeQuote intent{o->role, {}, o->buy, true, params["price"].toDouble(),
+                                    std::max(0.0, params["amount"].toDouble() - o->filled), o->target};
+            if (!quoteCurrent(intent, intentRevision))
                 return false;
             return true;
         });
 }
-void TradingWorker::submitNew(bool aggressive)
+bool TradingWorker::quoteCurrent(const HedgeQuote& desired, quint64 fillRevision)
 {
-    double remaining = engine.remaining();
-    bool buy = remaining > 0;
-    double qty = roundDown(std::abs(remaining), engine.spec.step);
-    // A floating-point remainder after closing is not an opposite position.
-    bool reducing =
-        std::abs(engine.inventory) >= engine.spec.step * .5 && engine.inventory * remaining < 0;
-    // Re-quantize the accumulated position before serializing a reduce-only amount.
-    if (reducing)
-        qty = roundDown(std::min(qty, std::abs(engine.inventory)), engine.spec.step);
-    if (qty < engine.spec.step * .5)
-    {
-        finishOperation();
-        return;
-    }
-    double mid = engine.quote.mid();
-    double p = aggressive ? (buy ? engine.quote.ask : engine.quote.bid)
-                          : (buy ? engine.quote.bid : engine.quote.ask);
-    double tick = engine.spec.tickAt(p);
-    p = tickPrice(p, tick, !buy);
-    if (aggressive && std::abs(p - mid) / mid * Limits::BasisPoints > engine.config.slippageBps)
-    {
-        if (status != "Waiting for narrower spread")
-            log("Spread exceeds the slippage bound; waiting automatically for a tradable price");
-        status = "Waiting for narrower spread";
-        retryAt = utcNow() + Exchange::MinimumTradingIntervalMs;
-        publish();
-        return;
-    }
-    const bool postOnly = engine.config.execution == Execution::PostOnly;
+    if (!engine.running || !synced || storageFailed || fillRevision != positionRevision)
+        return false;
+    if (!(engine.flattening ? engine.quote.fresh(utcNow()) : engine.safety(utcNow()).isEmpty()))
+        return false;
+    engine.plan(utcNow());
+    const auto& next = desired.buy ? engine.quotes.buy : engine.quotes.sell;
+    return next.enabled && next.role == desired.role &&
+           std::abs(next.amount - desired.amount) < engine.spec.step * .1 &&
+           std::abs(next.price - desired.price) < engine.spec.tickAt(desired.price) * Limits::QuoteDeadbandTicks &&
+           (desired.buy ? desired.price < engine.quote.ask : desired.price > engine.quote.bid);
+}
+void TradingWorker::submitNew(const HedgeQuote& desired)
+{
+    const double signedAmount = (desired.buy ? 1 : -1) * desired.amount;
+    const bool reducing = engine.inventory * signedAmount < 0 &&
+                          desired.amount <= std::abs(engine.inventory) + Epsilon;
+    const quint64 fillRevision = positionRevision;
     preflight(
-        [this, buy, qty, p, aggressive, reducing, postOnly]
+        [this, desired, reducing, fillRevision]
         {
+            if (!quoteCurrent(desired, fillRevision))
+                return;
+            for (const auto& existing : orders)
+                if ((!existing.terminal || existing.uncertain || !existing.mutation.isEmpty()) &&
+                    existing.buy == desired.buy)
+                    return;
             Order o;
             o.label = "gs_" + store->profileId() + "_" +
                       QUuid::createUuid().toString(QUuid::Id128).left(16);
             o.instrument = engine.config.instrument;
-            o.buy = buy;
-            o.total = qty;
-            o.price = p;
-            o.postOnly = postOnly;
-            o.ioc = aggressive;
+            o.role = desired.role;
+            o.target = desired.target;
+            o.buy = desired.buy;
+            o.total = desired.amount;
+            o.price = desired.price;
+            o.postOnly = true;
+            o.ioc = false;
             o.state = "pending";
             o.reduceOnly = reducing;
-            o.attemptAt = utcNow();
-            o.createdAt = o.attemptAt;
+            o.attemptAt = o.createdAt = utcNow();
             orders.append(o);
-            QJsonObject params{
-                {"instrument_name", o.instrument},
-                {"amount", qty},
-                {"price", p},
-                {"type", "limit"},
-                {"time_in_force", aggressive ? "immediate_or_cancel" : "good_til_cancelled"},
-                {"post_only", postOnly},
-                {"reject_post_only", postOnly},
-                {"reduce_only", reducing},
-                {"label", o.label}};
-            execute(buy ? "private/buy" : "private/sell", params, orders.last());
-        },
-        qty, p, buy, reducing);
+            execute(o.buy ? "private/buy" : "private/sell",
+                    {{"instrument_name", o.instrument}, {"amount", o.total}, {"price", o.price},
+                     {"type", "limit"}, {"time_in_force", "good_til_cancelled"},
+                     {"post_only", true}, {"reject_post_only", true},
+                     {"reduce_only", reducing}, {"label", o.label}}, orders.last());
+        }, desired.amount, desired.price, desired.buy, reducing);
 }
-void TradingWorker::editOrder(Order& o, bool aggressive)
+void TradingWorker::editOrder(Order& order, const HedgeQuote& desired)
 {
-    if (aggressive)
+    const double total = roundDown(order.filled + desired.amount, engine.spec.step);
+    const bool reducing = engine.inventory * (desired.buy ? 1 : -1) < 0 &&
+                          desired.amount <= std::abs(engine.inventory) + Epsilon;
+    const QString label = order.label;
+    const quint64 fillRevision = positionRevision;
+    preflight([this, label, desired, reducing, fillRevision, total]
     {
-        cancelOrder(o);
-        return;
-    } // edit has no supported IOC parameter; create IOC only after cancel acknowledgement.
-    double p = o.buy ? engine.quote.bid : engine.quote.ask;
-    p = tickPrice(p, engine.spec.tickAt(p), !o.buy);
-    double remaining = engine.remaining();
-    bool buy = remaining > 0;
-    if (buy != o.buy)
-    {
-        cancelOrder(o);
-        return;
-    }
-    double qty = roundDown(std::abs(remaining), engine.spec.step);
-    if (o.reduceOnly)
-        qty = roundDown(std::min(qty, std::abs(engine.inventory)), engine.spec.step);
-    if (qty < engine.spec.step * .5)
-    {
-        cancelOrder(o);
-        return;
-    }
-    double total = roundDown(o.filled + qty, engine.spec.step);
-    o.attemptAt = utcNow();
-    if (std::abs(o.price - p) < engine.spec.tickAt(p) * .1 &&
-        std::abs(o.total - total) < engine.spec.step * .1)
-        return;
-    execute("private/edit",
-            {{"order_id", o.id},
-             {"amount", total},
-             {"price", p},
-             {"post_only", o.postOnly},
-             {"reject_post_only", o.postOnly},
-             {"reduce_only", o.reduceOnly}},
-            o);
+        auto* o = findOrder(label);
+        if (!o || o->terminal || !o->mutation.isEmpty() || !quoteCurrent(desired, fillRevision))
+            return;
+        o->target = desired.target;
+        o->attemptAt = utcNow();
+        execute("private/edit", {{"order_id", o->id}, {"amount", total}, {"price", desired.price},
+                                 {"post_only", true}, {"reject_post_only", true},
+                                 {"reduce_only", reducing}}, *o);
+    }, desired.amount, desired.price, desired.buy, reducing);
 }
 void TradingWorker::cancelOrder(Order& o)
 {

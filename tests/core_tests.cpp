@@ -29,24 +29,23 @@ class CoreTests : public QObject
     }
     void initialAndEscape()
     {
-        qint64 t = 1000000000;
+        const qint64 t = 1000000000;
         auto e = fixtures::engine(t);
         QVERIFY(e.start(t));
-        auto a = e.evaluate(t);
-        QVERIFY(a);
-        QCOMPARE(a->target, -.05);
-        e.inventory = a->target;
-        e.complete(t);
-        QVERIFY(!e.evaluate(t));
-        t += 11000;
-        fixtures::refresh(e, t);
+        e.plan(t);
+        QCOMPARE(e.state, StrategyState::InitialHedge);
+        QCOMPARE(e.quotes.sell.target, -.05);
+        e.inventory = e.quotes.sell.target;
+        e.plan(t);
+        QCOMPARE(e.state, StrategyState::Quoting);
+        QVERIFY(e.quotes.buy.enabled && e.quotes.sell.enabled);
         e.options[0].delta = .54;
-        a = e.evaluate(t);
-        QVERIFY(a);
-        QVERIFY(std::abs(e.remaining() + .004) < 1e-10);
-        e.inventory = a->target;
-        e.complete(t);
-        QVERIFY(!e.evaluate(t + 1));
+        e.plan(t);
+        QCOMPARE(e.state, StrategyState::Corrective);
+        QVERIFY(std::abs(e.quotes.sell.amount - .004) < Epsilon);
+        e.inventory = e.quotes.sell.target;
+        e.plan(t);
+        QCOMPARE(e.state, StrategyState::Quoting);
     }
     void coverageAndMigration()
     {
@@ -59,13 +58,13 @@ class CoreTests : public QObject
         auto old = e.config.json();
         old.remove("hedge_percent");
         old["max_notional"] = 1;
-        old["execution"] = int(Execution::PostOnly);
+        old["execution"] = 0;
         const auto migrated = Config::fromJson(old);
         QCOMPARE(migrated.hedgePercent, 100.);
-        QCOMPARE(migrated.execution, Execution::Balanced);
+        QVERIFY(!migrated.json().contains("execution"));
         old = migrated.json();
-        old["execution"] = int(Execution::PostOnly);
-        QCOMPARE(Config::fromJson(old).execution, Execution::PostOnly);
+        old["execution"] = 0;
+        QVERIFY(!Config::fromJson(old).json().contains("execution"));
         QVERIFY(!old.contains("max_notional"));
         auto legacy = e.json();
         auto legacyConfig = e.config.json();
@@ -82,42 +81,59 @@ class CoreTests : public QObject
         e.options[0].delta = .501;
         QCOMPARE(e.target(), -.025);
     }
-    void passiveExecutionSettingsPersistAndMigrate()
+    void obsoleteExecutionSettingsAreIgnored()
+    {
+        auto saved = fixtures::engine(utcNow()).config.json();
+        saved["execution"] = 999;
+        saved["cooldown_ms"] = -1;
+        saved["maker_wait_ms"] = -1;
+        saved["balanced_passive_attempts"] = -1;
+        saved["slippage_bps"] = -1;
+        saved["delta_change"] = .3;
+        auto restored = Config::fromJson(saved);
+        QCOMPARE(restored.deltaChange, .3);
+        QVERIFY(restored.validate().isEmpty());
+        for (auto key : {"execution", "cooldown_ms", "maker_wait_ms", "balanced_passive_attempts", "slippage_bps"})
+            QVERIFY(!restored.json().contains(key));
+    }
+
+    void pacingAndFallbackFeesPersistAndValidate()
     {
         auto c = fixtures::engine(utcNow()).config;
-        QCOMPARE(c.makerWaitMs, 5000);
-        QCOMPARE(c.passiveAttempts(), 3);
-        c.execution = Execution::Aggressive;
-        QCOMPARE(c.passiveAttempts(), 1);
-        c.execution = Execution::PostOnly;
-        QCOMPARE(c.passiveAttempts(), 0);
-        c.balancedPassiveAttempts = 7;
-        c.aggressivePassiveAttempts = 2;
-        c.makerWaitMs = 6500;
+        QCOMPARE(c.tradingIntervalMs, 250);
+        QCOMPARE(c.fallbackMakerFee, .00015);
+        QCOMPARE(c.fallbackTakerFee, .00035);
+        c.tradingIntervalMs = 700;
+        c.fallbackMakerFee = -.0001;
+        c.fallbackTakerFee = .0007;
         auto saved = c.json();
         const auto restored = Config::fromJson(saved);
-        QCOMPARE(restored.balancedPassiveAttempts, 7);
-        QCOMPARE(restored.aggressivePassiveAttempts, 2);
-        QCOMPARE(restored.makerWaitMs, 6500);
+        QCOMPARE(restored.tradingIntervalMs, 700);
+        QCOMPARE(restored.fallbackMakerFee, -.0001);
+        QCOMPARE(restored.fallbackTakerFee, .0007);
         QVERIFY(restored.validate().isEmpty());
-        saved.remove("balanced_passive_attempts");
-        saved.remove("aggressive_passive_attempts");
-        saved["maker_wait_ms"] = 2000;
+        saved.remove("trading_interval_ms");
+        saved.remove("fallback_maker_fee");
+        saved.remove("fallback_taker_fee");
         const auto migrated = Config::fromJson(saved);
-        QCOMPARE(migrated.balancedPassiveAttempts, 3);
-        QCOMPARE(migrated.aggressivePassiveAttempts, 1);
-        QCOMPARE(migrated.makerWaitMs, 2000);
-        saved.remove("maker_wait_ms");
-        QCOMPARE(Config::fromJson(saved).makerWaitMs, 5000);
-        for (int invalid : {0, -1, Limits::MaxPassiveAttempts + 1})
+        QCOMPARE(migrated.tradingIntervalMs, 250);
+        QCOMPARE(migrated.fallbackMakerFee, .00015);
+        QCOMPARE(migrated.fallbackTakerFee, .00035);
+        for (int invalid : {0, Limits::MinTradingIntervalMs - 1, Limits::MaxTradingIntervalMs + 1})
         {
-            c.balancedPassiveAttempts = invalid;
+            c.tradingIntervalMs = invalid;
             QVERIFY(!c.validate().isEmpty());
-            c.balancedPassiveAttempts = 3;
-            c.aggressivePassiveAttempts = invalid;
-            QVERIFY(!c.validate().isEmpty());
-            c.aggressivePassiveAttempts = 1;
         }
+        c.tradingIntervalMs = 250;
+        c.fallbackMakerFee = std::numeric_limits<double>::quiet_NaN();
+        QVERIFY(!c.validate().isEmpty());
+        c.fallbackMakerFee = -1.1;
+        QVERIFY(!c.validate().isEmpty());
+        c.fallbackMakerFee = 0;
+        c.fallbackTakerFee = -.0001;
+        QVERIFY(!c.validate().isEmpty());
+        c.fallbackTakerFee = 1.1;
+        QVERIFY(!c.validate().isEmpty());
     }
     void minimumDeltaChangeIncludesCoverage()
     {
@@ -130,46 +146,97 @@ class CoreTests : public QObject
         e.config.hedgePercent = 0;
         QVERIFY(!e.config.validate().isEmpty());
     }
-    void completionKeepsUnhedgedDrift()
+    void restingLevelsUseConfiguredDeltaAndDoNotChasePrice()
     {
-        qint64 t = 1000000000;
+        const qint64 t = 1000000000;
+        for (double band : {.01, .1, .3})
+        {
+            auto e = fixtures::engine(t);
+            e.config.deltaChange = band;
+            e.inventory = -.05;
+            e.anchored = true;
+            QVERIFY(e.start(t));
+            e.plan(t);
+            QVERIFY(e.quotes.buy.enabled);
+            QVERIFY(e.quotes.sell.enabled);
+            QCOMPARE(e.quotes.buy.normalized, .5 - band);
+            QCOMPARE(e.quotes.sell.normalized, .5 + band);
+            const double lower = e.quotes.buy.price, upper = e.quotes.sell.price;
+            e.quote.bid += 20;
+            e.quote.ask += 20;
+            e.quote.index += 20;
+            e.plan(t);
+            QCOMPARE(e.quotes.buy.price, lower);
+            QCOMPARE(e.quotes.sell.price, upper);
+            QVERIFY(e.quotes.buy.target > e.inventory);
+            QVERIFY(e.quotes.sell.target < e.inventory);
+        }
+    }
+    void unreachableTightAndNonPositiveGammaLevels()
+    {
+        const qint64 t = 1000000000;
         auto e = fixtures::engine(t);
+        e.config.deltaChange = .3;
+        e.options.append(fixtures::option(t, false));
+        for (auto& o : e.options) {
+            o.index = o.underlying = 90000;
+            o.delta = optionModel(o, o.index, t).delta;
+        }
+        e.quote = {89999, 90001, 90000, 90000, t};
+        e.inventory = .0468;
+        e.anchored = true;
         QVERIFY(e.start(t));
-        auto operation = e.evaluate(t);
-        QVERIFY(operation);
-        e.inventory = operation->target;
-        e.options[0].delta = .52;
-        e.complete(t + 1000);
-        QCOMPARE(e.referenceDelta, .5);
-        fixtures::refresh(e, t + 12000);
-        e.options[0].delta = .55;
-        QVERIFY(e.evaluate(t + 12000));
+        e.plan(t);
+        QVERIFY(!e.quotes.buy.enabled);
+        QVERIFY(e.quotes.buy.reason.contains("reachable"));
+        QVERIFY(e.quotes.sell.enabled);
+        QVERIFY(e.quotes.sell.target < 0); // One sell closes and reverses.
+        e = fixtures::engine(t);
+        e.inventory = -.05;
+        e.anchored = true;
+        e.quote.bid -= 2000;
+        e.quote.ask += 2000;
+        QVERIFY(e.start(t));
+        e.plan(t);
+        QVERIFY(!e.quotes.buy.enabled && !e.quotes.sell.enabled);
+        QVERIFY(e.quotes.buy.reason.contains("tight"));
+        e.options[0].quantity = -.1;
+        QVERIFY(!e.start(t));
+        QVERIFY(e.problem.contains("positive"));
     }
-    void cooldownCoalescesSignals()
+    void liveDeltaDriftSelectsPassiveCorrection()
     {
-        qint64 t = 1000000000;
+        const qint64 t = 1000000000;
         auto e = fixtures::engine(t);
-        e.start(t);
-        auto a = e.evaluate(t);
-        e.inventory = a->target;
-        e.complete(t);
-        t += 1000;
-        fixtures::refresh(e, t);
-        e.options[0].delta = .7;
-        QVERIFY(!e.evaluate(t));
-        t += 10000;
-        fixtures::refresh(e, t);
+        e.inventory = -.05;
+        e.anchored = true;
+        QVERIFY(e.start(t));
         e.options[0].delta = .55;
-        a = e.evaluate(t);
-        QVERIFY(a);
-        QVERIFY(std::abs(a->target + .055) < 1e-10);
+        e.plan(t);
+        QCOMPARE(e.state, StrategyState::Corrective);
+        QVERIFY(e.quotes.sell.enabled && !e.quotes.buy.enabled);
+        QCOMPARE(e.quotes.sell.role, QString("corrective"));
+        e.inventory = e.quotes.sell.target;
+        e.plan(t);
+        QCOMPARE(e.state, StrategyState::Quoting);
+        auto saved = e.json();
+        QCOMPARE(saved["version"].toInt(), 2);
+        Hedger restored;
+        restored.restore(saved);
+        QVERIFY(!restored.running);
+        QCOMPARE(restored.state, StrategyState::Paused);
+        saved["version"] = 1;
+        restored.options.clear();
+        restored.restore(saved);
+        QCOMPARE(restored.inventory, e.inventory);
     }
+
     void stalenessAndExpiryStop()
     {
         qint64 t = 1000000000;
         auto e = fixtures::engine(t);
         QVERIFY(e.start(t));
-        QVERIFY(!e.evaluate(t + 6000));
+        e.plan(t + 6000);
         QVERIFY(!e.running);
         fixtures::refresh(e, t);
         e.options[0].spec.expiry = t + 29 * 60000;
@@ -233,12 +300,12 @@ class CoreTests : public QObject
     {
         auto e = fixtures::engine(1000000000);
         e.start(1000000000);
-        e.evaluate(1000000000);
+        e.plan(1000000000);
         auto j = e.json();
         Hedger copy;
         copy.restore(j);
         QVERIFY(!copy.running);
-        QVERIFY(copy.active);
+        QVERIFY(!copy.active);
         QCOMPARE(copy.operation.target, e.operation.target);
     }
     void modelParityAndGreeks()

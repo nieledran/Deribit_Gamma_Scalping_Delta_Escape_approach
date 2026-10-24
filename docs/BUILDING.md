@@ -28,7 +28,7 @@ python scripts/package.py --dist build/public-runtime
 
 The executable is `DeribitGamma.exe`; its profiles are `gamma-profiles/btc-testnet.db`, `btc-production.db`, `eth-testnet.db`, or `eth-production.db`. An analytics database is stored next to each core profile. Do not copy just a live `.db` while its WAL exists: use SQLite's online backup or stop the application first.
 
-Tests cover normalized delta, percentage coverage and uncapped targets, cooldown, expiry, margin validation, model/curve consistency, journal deduplication, settlement/funding, persistent first-Start reporting baselines, persistence-before-send and trading with a blocked GUI event loop. All exchange mutation tests use loopback fake servers. No testnet or Production order is submitted automatically.
+Tests cover normalized delta, percentage coverage and uncapped targets, resting levels, expiry, margin validation, model/curve consistency, journal deduplication, settlement/funding, persistent first-Start reporting baselines, persistence-before-send and trading with a blocked GUI event loop. All exchange mutation tests use loopback fake servers. No testnet or Production order is submitted automatically.
 
 The UI regression feeds changing prices, P&L, latency, clock availability and bot states
 through a 960 x 540 window and checks that field geometry stays fixed. CTest supplies
@@ -61,6 +61,6 @@ cancellation, transactional rollback, remaining external positions and analytics
 recovery after an interrupted reset notification. They use temporary profiles and
 loopback fake exchange servers only.
 
-Execution regressions include position-before-fill delivery, fill racing cancel, partial/duplicate/stale notifications, post-only edit rejection, partial IOC retries and partial reduce-only closing before reversal. Default Balanced passive orders are ordinary GTC limits. Accounting tests cover persistent construction baselines, history backfill and partial UTC daily export. Existing session rows remain raw export history; the live UI has one period.
+Execution regressions include position-before-fill delivery, fill racing cancel, partial/duplicate/stale notifications, post-only edit rejection and partial fills during a single-order reversal. All new orders are post-only GTC limits. Resting-order regressions cover both sides, nonlinear delta levels, unreachable/tight levels, quote deadband, passive alerts, single-order reversals and cancellation/recovery of both orders. Accounting tests cover persistent construction baselines, history backfill and partial UTC daily export. Existing session rows remain raw export history; the live UI has one period.
 
 Recovery tests also cover corrected positive/negative exchange clock offsets, stale quote/Greek outages, cancellation of automatic resumption by Stop, lost create replies, reconnect during a partial Close hedge, persistent external position changes and temporary matching-engine rejections. Client pacing tests verify 250 ms trading spacing at the reported five requests/s account limit, while a slower reported limit still wins. The P&L row is checked inside the main window.

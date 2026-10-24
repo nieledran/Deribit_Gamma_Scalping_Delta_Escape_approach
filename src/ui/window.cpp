@@ -67,12 +67,9 @@ void Window::populateConfig(const Config& c)
     marginEnabled->setChecked(c.marginLimitEnabled);
     margin->setValue(c.maxMarginUsage > 0 ? c.maxMarginUsage * 100 : 50);
     margin->setEnabled(c.marginLimitEnabled);
-    cooldown->setValue(c.cooldownMs / 1000.0);
-    makerWait->setValue(c.makerWaitMs / 1000.0);
-    balancedAttempts->setValue(c.balancedPassiveAttempts);
-    aggressiveAttempts->setValue(c.aggressivePassiveAttempts);
-    slippage->setValue(c.slippageBps);
-    execution->setCurrentIndex(int(c.execution));
+    tradingSpacing->setValue(c.tradingIntervalMs);
+    fallbackMaker->setValue(c.fallbackMakerFee * 100);
+    fallbackTaker->setValue(c.fallbackTakerFee * 100);
     rendering = wasRendering;
 }
 Config Window::configFromUi() const
@@ -82,12 +79,10 @@ Config Window::configFromUi() const
     c.hedgePercent = coverage->value();
     c.marginLimitEnabled = marginEnabled->isChecked();
     c.maxMarginUsage = c.marginLimitEnabled ? margin->value() / 100 : 0;
-    c.cooldownMs = int(cooldown->value() * 1000);
-    c.makerWaitMs = int(makerWait->value() * 1000);
-    c.balancedPassiveAttempts = balancedAttempts->value();
-    c.aggressivePassiveAttempts = aggressiveAttempts->value();
-    c.slippageBps = slippage->value();
-    c.execution = Execution(execution->currentIndex());
+    c.tradingIntervalMs = tradingSpacing->value();
+    // Four decimal places in percent correspond to six in the stored rate.
+    c.fallbackMakerFee = std::round(fallbackMaker->value() * 10000) / 1000000;
+    c.fallbackTakerFee = std::round(fallbackTaker->value() * 10000) / 1000000;
     c.selected = draftSelected;
     return c;
 }

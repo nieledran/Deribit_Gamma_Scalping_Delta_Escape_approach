@@ -238,6 +238,65 @@ class ClientTests : public QObject
         client.stop();
     }
 
+    void configuredTradingSpacingRespectsAccountLimits_data()
+    {
+        QTest::addColumn<int>("configured");
+        QTest::addColumn<int>("accountRate");
+        QTest::addColumn<bool>("beforeConnect");
+        QTest::addColumn<int>("expected");
+        QTest::newRow("saved-slower-spacing") << 600 << 5 << true << 600;
+        QTest::newRow("account-limit-wins-after-edit") << 100 << 1 << false << 1250;
+        QTest::newRow("saved-faster-spacing") << 100 << 100 << true << 250;
+    }
+    void configuredTradingSpacingRespectsAccountLimits()
+    {
+        QFETCH(int, configured);
+        QFETCH(int, accountRate);
+        QFETCH(bool, beforeConnect);
+        QFETCH(int, expected);
+        QWebSocketServer server("Configured pacing", QWebSocketServer::NonSecureMode);
+        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+        Client client;
+        QSignalSpy authenticated(&client, &Client::authenticatedSession);
+        QSignalSpy notices(&client, &Client::notice);
+        QList<qint64> arrivals;
+        QElapsedTimer clock;
+        clock.start();
+        connect(&server, &QWebSocketServer::newConnection, this,
+                [&]
+                {
+                    auto* peer = server.nextPendingConnection();
+                    peer->setParent(&server);
+                    connect(peer, &QWebSocket::textMessageReceived, this,
+                            [&, peer](const QString& frame)
+                            {
+                                const auto j = QJsonDocument::fromJson(frame.toUtf8()).object();
+                                if (j["method"] == "private/buy")
+                                    arrivals.append(clock.elapsed());
+                                peer->sendTextMessage(QString::fromUtf8(
+                                    QJsonDocument(QJsonObject{
+                                        {"id", j["id"]},
+                                        {"result", QJsonObject{{"expires_in", 3600}}}}).toJson()));
+                            });
+                });
+        if (beforeConnect)
+            client.setTradingIntervalMs(configured);
+        client.connectTo("fake", "fake", false,
+                         QUrl(QString("ws://127.0.0.1:%1").arg(server.serverPort())));
+        QTRY_COMPARE(authenticated.size(), 1);
+        client.setTradingLimits({{"matching_engine", QJsonObject{
+            {"trading", QJsonObject{{"total", QJsonObject{{"rate", accountRate}}}}}}}});
+        if (!beforeConnect)
+            client.setTradingIntervalMs(configured);
+        QVERIFY(notices.last().first().toString().contains(
+            QString::number(1000.0 / expected, 'f', 1) + " requests/s"));
+        int completed = 0;
+        for (int i = 0; i < 3; ++i)
+            client.call("private/buy", {}, [&](const RpcResult&) { ++completed; }, true);
+        QTRY_COMPARE_WITH_TIMEOUT(completed, 3, 6000);
+        QCOMPARE(arrivals.size(), 3);
+        QVERIFY(arrivals.last() - arrivals.first() >= 2 * expected - 30);
+    }
     void destructionWithPendingRequests()
     {
         QWebSocketServer server("Destruction simulator", QWebSocketServer::NonSecureMode);

@@ -15,13 +15,6 @@
 namespace scalper
 {
 constexpr double Epsilon = 1e-10;
-enum class Execution
-{
-    PostOnly,
-    Balanced,
-    Aggressive
-};
-QString executionName(Execution mode);
 qint64 utcNow();
 QString isoUtc(qint64 milliseconds);
 double number(const QJsonObject& json, const char* key);
@@ -33,21 +26,14 @@ struct Config
     bool production = false;
     bool marginLimitEnabled = false;
     QStringList selected;
-    double deltaChange = .01, hedgePercent = 100, maxMarginUsage = 0, slippageBps = 5;
-    int cooldownMs = 10000, makerWaitMs = 5000;
-    int balancedPassiveAttempts = 3, aggressivePassiveAttempts = 1;
-    Execution execution = Execution::Balanced;
+    double deltaChange = .01, hedgePercent = 100, maxMarginUsage = 0;
+    int tradingIntervalMs = Exchange::MinimumTradingIntervalMs;
+    double fallbackMakerFee = Exchange::DefaultMakerFee, fallbackTakerFee = Exchange::DefaultTakerFee;
     QString base() const
     {
         return instrument.startsWith("ETH") ? "ETH" : "BTC";
     }
     QString validate() const;
-    int passiveAttempts() const
-    {
-        return execution == Execution::PostOnly ? 0
-               : execution == Execution::Balanced ? balancedPassiveAttempts
-                                                  : aggressivePassiveAttempts;
-    }
     QJsonObject json() const;
     static Config fromJson(const QJsonObject& json);
 };
@@ -124,6 +110,8 @@ struct Margin
 struct Order
 {
     QString label, id, instrument, state = "open";
+    QString role = "legacy";
+    double target = 0;
     bool buy = false, postOnly = true, ioc = false, reduceOnly = false, terminal = false,
          uncertain = false;
     double price = 0, total = 0, filled = 0;
@@ -132,6 +120,20 @@ struct Order
     QJsonObject request;
     QJsonObject json() const;
     static Order fromJson(const QJsonObject& json);
+};
+enum class StrategyState { Paused, InitialHedge, Quoting, Corrective, Closing };
+QString strategyName(StrategyState state);
+struct HedgeQuote
+{
+    QString role, reason;
+    bool buy = false, enabled = false;
+    double price = 0, amount = 0, target = 0, normalized = 0;
+    QJsonObject json() const;
+};
+struct HedgeQuotes
+{
+    HedgeQuote buy, sell;
+    double normalized = 0, error = 0;
 };
 struct TradingSnapshot
 {
@@ -144,7 +146,7 @@ struct TradingSnapshot
     bool anchored = false, executing = false;
     bool positionMismatch = false;
     double externalPosition = 0;
-    qint64 timestamp = 0, cooldownUntil = 0, latencyMs = -1;
+    qint64 timestamp = 0, latencyMs = -1;
     qint64 rpcQueueMs = -1, lastHedgeMs = -1;
     std::optional<qint64> exchangeClockOffsetMs;
     double inventory = 0, target = 0, referenceDelta = 0, liquidation = 0;
@@ -156,6 +158,9 @@ struct TradingSnapshot
     Margin margin;
     QVector<Option> positions;
     QVector<Order> orders;
+    StrategyState strategy = StrategyState::Paused;
+    HedgeQuotes hedgeQuotes;
+    QString hedgeAlert;
     QStringList messages;
     QVector<Option> openOptions(qint64 now) const;
 };

@@ -52,11 +52,10 @@ class Window : public QMainWindow
     QPushButton *connectButton = nullptr, *startButton = nullptr, *stopButton = nullptr,
                 *selectButton = nullptr;
     QAction *closeAction = nullptr, *deleteAction = nullptr;
-    QDoubleSpinBox *band = nullptr, *coverage = nullptr, *margin = nullptr, *cooldown = nullptr,
-                   *makerWait = nullptr, *slippage = nullptr;
+    QDoubleSpinBox *band = nullptr, *coverage = nullptr, *margin = nullptr,
+                   *fallbackMaker = nullptr, *fallbackTaker = nullptr;
     QCheckBox* marginEnabled = nullptr;
-    QComboBox* execution = nullptr;
-    QSpinBox *balancedAttempts = nullptr, *aggressiveAttempts = nullptr;
+    QSpinBox* tradingSpacing = nullptr;
     QTableWidget *positions = nullptr, *pnl = nullptr, *orders = nullptr;
     QTabWidget* tabs = nullptr;
     QLabel *status = nullptr, *latency = nullptr, *risk = nullptr, *estimate = nullptr,
@@ -67,7 +66,7 @@ class Window : public QMainWindow
            *normalizedValue = nullptr, *referenceValue = nullptr,
            *legsValue = nullptr, *activity = nullptr, *executionState = nullptr,
            *pnlCoverage = nullptr, *pnlPeriod = nullptr, *hedgeRemaining = nullptr,
-           *targetDeltaValue = nullptr;
+           *targetDeltaValue = nullptr, *buyLevel = nullptr, *sellLevel = nullptr;
     QuoteLabel *bidQuote = nullptr, *askQuote = nullptr;
     QPlainTextEdit* journal = nullptr;
     QDialog* advancedDialog = nullptr;

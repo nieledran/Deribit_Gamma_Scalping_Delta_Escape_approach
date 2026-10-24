@@ -26,6 +26,7 @@ inline constexpr int MarketRefreshIntervalMs = SecondMs;
 inline constexpr int MarketRefreshAgeMs = 2 * SecondMs;
 inline constexpr int AnalyticsIntervalMs = 500;
 inline constexpr int FillRecoveryDelayMs = 500;
+inline constexpr int PassiveHedgeAlertMs = 30 * SecondMs;
 inline constexpr int FundingCarryWindowMs = 10 * SecondMs;
 
 inline constexpr qint64 fundingSessionStart(qint64 timestamp)
@@ -36,13 +37,11 @@ inline constexpr qint64 fundingSessionStart(qint64 timestamp)
 
 namespace Limits
 {
+inline constexpr int QuoteDeadbandTicks = 3;
 inline constexpr double MaxDeltaChange = 2;
-inline constexpr double MaxSlippageBps = 1000;
 inline constexpr double MaxMarginUsagePercent = 99.99;
-inline constexpr int MinOperationIntervalMs = 500;
-inline constexpr int MaxCooldownMs = Time::HourMs;
-inline constexpr int MaxMakerWaitMs = Time::MinuteMs;
-inline constexpr int MaxPassiveAttempts = 100;
+inline constexpr int MinTradingIntervalMs = 100;
+inline constexpr int MaxTradingIntervalMs = Time::MinuteMs;
 inline constexpr int RecentOrders = 100;
 inline constexpr int JournalMessages = 200;
 inline constexpr double BasisPoints = 10000;

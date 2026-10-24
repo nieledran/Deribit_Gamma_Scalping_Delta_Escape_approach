@@ -6,6 +6,8 @@ void Window::seedDemo()
 {
     TradingSnapshot s;
     s.config = initial;
+    s.makerFee = s.config.fallbackMakerFee;
+    s.takerFee = s.config.fallbackTakerFee;
     s.config.maxMarginUsage = .5;
     s.profileId = "offline-demo";
     s.account = "OFFLINE DEMO";
@@ -58,6 +60,21 @@ void Window::seedDemo()
     s.config.selected = {s.positions[0].spec.name, o.spec.name};
     s.inventory = -.004;
     s.target = -.004;
+    Hedger preview;
+    preview.config = s.config;
+    preview.spec.name = s.config.instrument;
+    preview.spec.base = s.config.base();
+    preview.spec.settlement = "USDC";
+    preview.spec.tick = 1;
+    preview.spec.step = .0001;
+    preview.options = s.positions;
+    preview.quote = s.quote;
+    preview.margin = s.margin;
+    preview.inventory = s.inventory;
+    preview.running = preview.anchored = true;
+    preview.plan(s.timestamp);
+    s.strategy = preview.state;
+    s.hedgeQuotes = preview.quotes;
     s.messages = {isoUtc(s.timestamp) + "  Offline demo. No exchange connection."};
     AnalyticsSnapshot a;
     a.constructionId = s.constructionId;

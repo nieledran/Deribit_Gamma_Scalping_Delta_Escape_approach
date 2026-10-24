@@ -26,6 +26,8 @@ void TradingWorker::connectExchange(QString id, QString secret)
             clientSecret = std::move(secret);
             status = "Connecting";
             engine.problem.clear();
+            accountMakerFee.reset();
+            accountTakerFee.reset();
             client->connectTo(clientId, clientSecret, engine.config.production, endpoint);
         });
 }
@@ -37,6 +39,8 @@ void TradingWorker::initializeExchange()
     syncing = true;
     busy = false;
     status = "Synchronizing";
+    accountMakerFee.reset();
+    accountTakerFee.reset();
     engine.quote.at = 0;
     for (auto& option : positions)
         option.tickerAt = 0;
@@ -98,13 +102,13 @@ void TradingWorker::initializeExchange()
                                    .toObject();
                     if (fee["type"] == "fixed")
                     {
-                        makerFee = number(fee, "maker");
-                        takerFee = number(fee, "taker");
+                        accountMakerFee = number(fee, "maker");
+                        accountTakerFee = number(fee, "taker");
                     }
                     else if (fee["type"] == "relative")
                     {
-                        makerFee = Exchange::DefaultMakerFee * number(fee, "maker");
-                        takerFee = Exchange::DefaultTakerFee * number(fee, "taker");
+                        accountMakerFee = Exchange::DefaultMakerFee * number(fee, "maker");
+                        accountTakerFee = Exchange::DefaultTakerFee * number(fee, "taker");
                     }
                     client->call(
                         "public/get_instrument", {{"instrument_name", engine.config.instrument}},

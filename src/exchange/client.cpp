@@ -85,7 +85,8 @@ void Client::connectTo(const QString& id, const QString& secret, bool production
     wanted = true;
     retryMs = InitialRetryMs;
     connectionStarted = clock.elapsed();
-    mutationInterval = MinimumTradingIntervalMs;
+    accountTradingInterval = 0;
+    mutationInterval = configuredTradingInterval;
     endpoint = testEndpoint.isEmpty()
                    ? QUrl(production ? Exchange::ProductionUrl : Exchange::TestnetUrl)
                    : testEndpoint;
@@ -268,11 +269,25 @@ void Client::setTradingLimits(const QJsonObject& limits)
     if (limits["limits_per_currency"].toBool())
         matching = matching["usdc"].toObject();
     const double rate = matching["trading"].toObject()["total"].toObject()["rate"].toDouble();
-    mutationInterval =
+    accountTradingInterval =
         std::isfinite(rate) && rate >= 1
-            ? static_cast<int>(std::max<double>(MinimumTradingIntervalMs,
-                                                std::ceil(Exchange::AccountRateHeadroomMs / rate)))
-            : MinimumTradingIntervalMs;
+            ? static_cast<int>(std::ceil(Exchange::AccountRateHeadroomMs / rate))
+            : 0;
+    updateTradingPacing();
+}
+
+void Client::setTradingIntervalMs(int milliseconds)
+{
+    configuredTradingInterval =
+        std::clamp(milliseconds, Limits::MinTradingIntervalMs, Limits::MaxTradingIntervalMs);
+    updateTradingPacing();
+}
+
+void Client::updateTradingPacing()
+{
+    mutationInterval = std::max({MinimumTradingIntervalMs, configuredTradingInterval, accountTradingInterval});
+    if (!outbound.empty())
+        sendTimer.start(0);
     emit notice(QString("Trading RPC pacing: at most %1 requests/s in this window; account limits "
                         "are shared with other clients")
                     .arg(double(Time::SecondMs) / mutationInterval, 0, 'f', 1));

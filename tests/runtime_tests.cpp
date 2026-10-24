@@ -5,6 +5,7 @@
 #include "ui/window.h"
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QGridLayout>
 #include <QJsonDocument>
 #include <QMenu>
 #include <QMessageBox>
@@ -16,6 +17,8 @@
 #include <atomic>
 #include <utility>
 using namespace scalper;
+// Legacy harness argument retained locally while exercising migrated profile scenarios.
+enum class Execution { PostOnly, Balanced, Aggressive };
 class FakeDeribit : public QObject
 {
     Q_OBJECT
@@ -32,6 +35,7 @@ class FakeDeribit : public QObject
     std::atomic<int> optionTickerRequests{0}, positionRequests{0};
     std::atomic<int> invalidAmounts{0};
     QJsonObject lastSubmitted;
+    QJsonObject accountFees;
     std::atomic<bool> durable{true};
     bool holdMaker = false, dropReply = false;
     bool dropBeforeCreate = false;
@@ -49,10 +53,12 @@ class FakeDeribit : public QObject
     bool perpetualNotifications = true, stalePerpetualSnapshots = false;
     bool invalidBid = false, invalidGreeks = false;
     int rejectNextCreateCode = 0;
-    int optionSnapshotDelayMs = 0, failPositionReads = 0, clockLeadMs = 0;
+    int optionSnapshotDelayMs = 0, failPositionReads = 0, clockLeadMs = 0, marginDelayMs = 0;
+    std::atomic<int> marginRequests{0};
+    double lastMarginAmount = 0;
     QJsonArray optionPositions;
     QHash<QString, Instrument> optionSpecs;
-    double position = 0, delta = .5, lastEditAmount = 0;
+    double position = 0, delta = .5, gamma = .000025, lastEditAmount = 0;
     QList<double> positionReplies;
     QList<qint64> positionReadTimes;
     int next = 0;
@@ -97,7 +103,7 @@ class FakeDeribit : public QObject
                 {"mark_iv", 60},
                 {"greeks", QJsonObject{{"delta", invalidGreeks ? QJsonValue(QJsonValue::Null)
                                                                : QJsonValue(delta)},
-                                       {"gamma", .000025},
+                                       {"gamma", gamma},
                                        {"theta", -100},
                                        {"vega", 110}}}};
     }
@@ -208,7 +214,9 @@ class FakeDeribit : public QObject
                  QJsonObject{{"id", 123},
                              {"margin_balance", 10000},
                              {"maintenance_margin", 100},
-                             {"available_funds", 9900}});
+                             {"available_funds", 9900},
+                             {"fees", QJsonObject{{"btc_usdc", QJsonObject{
+                                 {"perpetual", QJsonObject{{"default", accountFees}}}}}}}});
             return;
         }
         if (method == "public/get_instrument")
@@ -368,7 +376,11 @@ class FakeDeribit : public QObject
         }
         if (method == "private/get_margins")
         {
-            send(socket, id, QJsonObject{{"buy", 10}, {"sell", 10}});
+            ++marginRequests;
+            lastMarginAmount = p["amount"].toDouble();
+            QTimer::singleShot(marginDelayMs, this, [this, socket, id] {
+                send(socket, id, QJsonObject{{"buy", 10}, {"sell", 10}});
+            });
             return;
         }
         if (method == "private/get_transaction_log")
@@ -446,7 +458,9 @@ class FakeDeribit : public QObject
                               {"time_in_force", p["time_in_force"]},
                               {"last_update_timestamp", utcNow()}};
             QJsonArray trades;
-            if (!holdMaker || p["time_in_force"] == "immediate_or_cancel")
+            if ((!holdMaker && (method == "private/buy" ? p["price"].toDouble() >= 99999 + quoteShift - spreadExtra
+                                                                 : p["price"].toDouble() <= 100001 + quoteShift + spreadExtra)) ||
+                p["time_in_force"] == "immediate_or_cancel")
             {
                 const double executed = partialIoc && p["time_in_force"] == "immediate_or_cancel" &&
                                                 amount > .0001 + Epsilon
@@ -516,6 +530,7 @@ class FakeDeribit : public QObject
                     {
                         order["price"] = p["price"];
                         order["amount"] = p["amount"];
+                        order["reduce_only"] = p["reduce_only"];
                         lastEditAmount = p["amount"].toDouble();
                     }
                     order["last_update_timestamp"] = utcNow();
@@ -562,8 +577,7 @@ struct RuntimeHarness
         c.hedgePercent = 20;
         c.selected = {fixtures::option(utcNow()).spec.name};
         c.maxMarginUsage = .5;
-        c.execution = mode;
-        c.makerWaitMs = 500;
+        Q_UNUSED(mode);
         worker = new TradingWorker(path, c, state, QUrl(QString("ws://127.0.0.1:%1").arg(port)));
         worker->moveToThread(&thread);
         QObject::connect(&thread, &QThread::started, worker, &TradingWorker::initialize);
@@ -598,6 +612,18 @@ struct RuntimeHarness
     {
         std::lock_guard<std::mutex> lock(state->mutex);
         return state->trading;
+    }
+    int liveCount()
+    {
+        const auto current = snapshot();
+        return int(std::count_if(current.orders.begin(), current.orders.end(),
+                                 [](const Order& order) { return !order.terminal; }));
+    }
+    int filledCount()
+    {
+        const auto current = snapshot();
+        return int(std::count_if(current.orders.begin(), current.orders.end(),
+                                 [](const Order& order) { return order.filled > Epsilon; }));
     }
     void start()
     {
@@ -743,7 +769,7 @@ class RuntimeTests : public QObject
         QVERIFY2(h.snapshot().running, qPrintable(h.snapshot().problem));
         QVERIFY(h.snapshot().positions.first().freshGreeks(utcNow()));
         QVERIFY(h.server->optionTickerRequests.load() > snapshots);
-        QCOMPARE(h.server->mutations.load(), 1);
+        QCOMPARE(h.server->mutations.load(), 3);
     }
     void staleOptionSnapshotsDoNotPermitOrders()
     {
@@ -889,25 +915,21 @@ class RuntimeTests : public QObject
         }
         QVERIFY(snapshot().exchangeClockOffsetMs.has_value());
         QVERIFY(window.findChild<QLineEdit*>("clientSecret")->text().isEmpty());
-        auto* cooldown = window.findChild<QDoubleSpinBox*>("cooldown");
-        QVERIFY(!window.findChild<QDialog*>("advancedDialog")->isAncestorOf(cooldown));
-        cooldown->setValue(2.3);
-        auto* advanced = window.findChild<QDialog*>("advancedDialog");
-        auto* balanced = window.findChild<QSpinBox*>("balancedPassiveAttempts");
-        auto* aggressive = window.findChild<QSpinBox*>("aggressivePassiveAttempts");
-        QVERIFY(advanced->isAncestorOf(balanced));
-        QVERIFY(advanced->isAncestorOf(aggressive));
-        balanced->setValue(4);
-        aggressive->setValue(2);
-        window.findChild<QDoubleSpinBox*>("makerWait")->setValue(5);
+        QVERIFY(!window.findChild<QDoubleSpinBox*>("cooldown"));
+        QVERIFY(!window.findChild<QDoubleSpinBox*>("makerWait"));
+        QVERIFY(!window.findChild<QComboBox*>("executionMode"));
+        window.findChild<QSpinBox*>("tradingRequestSpacing")->setValue(600);
+        window.findChild<QDoubleSpinBox*>("fallbackMakerFee")->setValue(-.01);
+        window.findChild<QDoubleSpinBox*>("fallbackTakerFee")->setValue(.07);
         auto* apply = window.findChild<QPushButton*>("applySettings");
         QTRY_VERIFY(apply->property("pendingChanges").toBool());
         QCOMPARE(apply->text(), QString("Apply"));
         apply->click();
-        QTRY_COMPARE(snapshot().config.cooldownMs, 2300);
-        QTRY_COMPARE(snapshot().config.balancedPassiveAttempts, 4);
-        QCOMPARE(snapshot().config.aggressivePassiveAttempts, 2);
-        QCOMPARE(snapshot().config.makerWaitMs, 5000);
+        QTRY_COMPARE(snapshot().config.tradingIntervalMs, 600);
+        QCOMPARE(snapshot().config.fallbackMakerFee, -.0001);
+        QCOMPARE(snapshot().config.fallbackTakerFee, .0007);
+        QCOMPARE(snapshot().makerFee, -.0001);
+        QCOMPARE(snapshot().takerFee, .0007);
         QTRY_VERIFY(!apply->property("pendingChanges").toBool());
         window.findChild<QPushButton*>("start")->click();
         QTRY_VERIFY_WITH_TIMEOUT(std::abs(snapshot().inventory + .01) < 1e-8, 10000);
@@ -995,7 +1017,6 @@ class RuntimeTests : public QObject
             engine.inventory = inventory;
             engine.config.hedgePercent = 3.8;
             engine.config.deltaChange = .04; // Keep this small basket above the minimum hedge lot.
-            engine.config.execution = Execution::Balanced;
             store.bind("123/testnet/BTC_USDC-PERPETUAL");
             store.save(engine, {});
         }
@@ -1018,17 +1039,11 @@ class RuntimeTests : public QObject
             h.server,
             [&]
             {
-                const bool hadPosition = std::abs(inventory) > Epsilon;
-                QCOMPARE(h.server->submitted.size(), hadPosition ? 2 : 1);
-                if (hadPosition)
-                {
-                    const auto first = h.server->submitted.first();
-                    QCOMPARE(first["amount"].toDouble(), .0017);
-                    QVERIFY(first["reduce_only"].toBool());
-                }
-                const auto last = h.server->submitted.last();
-                QCOMPARE(last["amount"].toDouble(), .0019);
-                QVERIFY(!last["reduce_only"].toBool());
+                const auto first = h.server->submitted.first();
+                const double quantity = std::abs(target - (std::abs(inventory) < Epsilon ? 0 : inventory));
+                QVERIFY(std::abs(first["amount"].toDouble() - quantity) < Epsilon);
+                QVERIFY(!first["reduce_only"].toBool());
+                QVERIFY(first["post_only"].toBool());
             },
             Qt::BlockingQueuedConnection);
     }
@@ -1085,7 +1100,7 @@ class RuntimeTests : public QObject
         QTest::qWait(50);
         QVERIFY(window.findChild<QPushButton*>("start"));
         QVERIFY(!window.findChild<ProfileChart*>("portfolioChart"));
-        QCOMPARE(window.findChild<QComboBox*>("executionMode")->currentText(), QString("Balanced"));
+        QVERIFY(!window.findChild<QComboBox*>("executionMode"));
         QVERIFY(window.findChild<QLabel*>("normalizedDelta")->text().contains("Normalized delta"));
         QVERIFY(!window.findChild<QLabel*>("netPnl"));
         auto* deltaPanel = window.findChild<QWidget*>("deltaPanel");
@@ -1093,54 +1108,82 @@ class RuntimeTests : public QObject
         QCOMPARE(executionPanel->geometry().top(), deltaPanel->geometry().top());
         QCOMPARE(executionPanel->height(), deltaPanel->height());
         auto* rebalance = window.findChild<QLabel*>("rebalanceBand");
-        QCOMPARE(rebalance->parentWidget(), executionPanel);
+        auto* marketPanel = window.findChild<QWidget*>("marketPanel");
+        QCOMPARE(rebalance->parentWidget(), marketPanel);
+        QCOMPARE(window.findChild<QLabel*>("hedgeEstimate")->parentWidget(), marketPanel);
         auto* breakEven = window.findChild<QLabel*>("breakEvenMove");
         QCOMPARE(breakEven->parentWidget(), executionPanel);
         QVERIFY(!window.findChild<QLabel*>("escapeDelta"));
-        QCOMPARE(window.findChild<QLabel*>("tradingActivity")->y(),
-                 window.findChild<QLabel*>("normalizedDelta")->y());
-        QCOMPARE(rebalance->y(), window.findChild<QLabel*>("referenceDelta")->y());
-        QCOMPARE(breakEven->y(), window.findChild<QLabel*>("targetNetDelta")->y());
+        QVERIFY(window.findChild<QLabel*>("buyHedgeLevel")->y() <
+                window.findChild<QLabel*>("sellHedgeLevel")->y());
+        for (auto name : {"deltaPanel", "hedgePanel", "executionPanel"})
+            QCOMPARE(qobject_cast<QGridLayout*>(window.findChild<QWidget*>(name)->layout())->rowCount(), 4);
         auto* bid = window.findChild<QWidget*>("bidQuote");
         auto* ask = window.findChild<QWidget*>("askQuote");
         auto* middle = window.findChild<QLabel*>("riskSummary");
-        QVERIFY(bid->x() < ask->x() && ask->x() < middle->x());
+        QVERIFY(rebalance->x() < bid->x() && bid->x() < ask->x() && ask->x() < middle->x());
+        QVERIFY(middle->x() < window.findChild<QLabel*>("hedgeEstimate")->x());
         QVERIFY(middle->text().startsWith("Middle Price:"));
     }
-    void advancedAttemptCountsAndCompactDialog()
+    void passivePolicyHasNoObsoleteControls()
     {
         Window window("", Config{}, true);
         window.show();
-        auto* advanced = window.findChild<QDialog*>("advancedDialog");
-        auto* mode = window.findChild<QComboBox*>("executionMode");
-        auto* balanced = window.findChild<QSpinBox*>("balancedPassiveAttempts");
-        auto* aggressive = window.findChild<QSpinBox*>("aggressivePassiveAttempts");
-        auto* duration = window.findChild<QDoubleSpinBox*>("makerWait");
-        QCOMPARE(duration->value(), 5.);
-        QTimer::singleShot(1000, advanced, &QDialog::reject);
-        QTimer::singleShot(50, &window,
-                           [&]
-                           {
-                               QVERIFY(balanced->isVisible());
-                               QCOMPARE(balanced->value(), 3);
-                               mode->setCurrentIndex(int(Execution::Aggressive));
-                               QVERIFY(aggressive->isVisible());
-                               QCOMPARE(aggressive->value(), 1);
-                               aggressive->setValue(2);
-                               mode->setCurrentIndex(int(Execution::Balanced));
-                               QCOMPARE(balanced->value(), 3);
-                               balanced->setValue(4);
-                               duration->setValue(7);
-                               auto* buttons = advanced->findChild<QDialogButtonBox*>();
-                               QVERIFY(advanced->width() >= 450);
-                               QVERIFY(advanced->height() - buttons->geometry().bottom() <= 16);
-                               advanced->reject();
-                           });
-        window.findChild<QPushButton*>("advanced")->click();
-        QCOMPARE(balanced->value(), 3);
-        QCOMPARE(aggressive->value(), 1);
-        QCOMPARE(duration->value(), 5.);
-        QCOMPARE(mode->currentIndex(), int(Execution::Balanced));
+        QVERIFY(!window.findChild<QComboBox*>("executionMode"));
+        QVERIFY(!window.findChild<QDoubleSpinBox*>("cooldown"));
+        QVERIFY(!window.findChild<QDoubleSpinBox*>("makerWait"));
+        QVERIFY(!window.findChild<QDoubleSpinBox*>("slippage"));
+        QVERIFY(window.findChild<QLabel*>("executionPolicy")->text().contains("Long-gamma"));
+        QVERIFY(window.findChild<QLabel*>("buyHedgeLevel"));
+        QVERIFY(window.findChild<QLabel*>("sellHedgeLevel"));
+        QCOMPARE(window.findChild<QSpinBox*>("tradingRequestSpacing")->minimum(), 250);
+    }
+
+    void reportedAccountFeesOverrideFallbacks_data()
+    {
+        QTest::addColumn<bool>("relative");
+        QTest::newRow("fixed") << false;
+        QTest::newRow("relative") << true;
+    }
+    void reportedAccountFeesOverrideFallbacks()
+    {
+        QFETCH(bool, relative);
+        QTemporaryDir directory;
+        RuntimeHarness h(directory.filePath("fees.db"));
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
+        auto c = h.snapshot().config;
+        c.fallbackMakerFee = -.0001;
+        c.fallbackTakerFee = .0007;
+        QMetaObject::invokeMethod(h.worker, [&, c] { h.worker->applyConfig(c); },
+                                  Qt::BlockingQueuedConnection);
+        QTRY_COMPARE(h.snapshot().makerFee, c.fallbackMakerFee);
+        QCOMPARE(h.snapshot().takerFee, c.fallbackTakerFee);
+        QMetaObject::invokeMethod(h.server,
+            [&] { h.server->accountFees = relative
+                ? QJsonObject{{"type", "relative"}, {"maker", .5}, {"taker", .75}}
+                : QJsonObject{{"type", "fixed"}, {"maker", -.00005}, {"taker", .0002}}; },
+            Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(h.worker, [&] { h.worker->connectExchange("fake", "fake"); },
+                                  Qt::BlockingQueuedConnection);
+        const double expectedMaker = relative ? Exchange::DefaultMakerFee * .5 : -.00005;
+        const double expectedTaker = relative ? Exchange::DefaultTakerFee * .75 : .0002;
+        QTRY_COMPARE(h.snapshot().makerFee, expectedMaker);
+        QTRY_VERIFY(h.snapshot().synced);
+        QCOMPARE(h.snapshot().takerFee, expectedTaker);
+        c.fallbackMakerFee = .0002;
+        c.fallbackTakerFee = .0009;
+        QMetaObject::invokeMethod(h.worker, [&, c] { h.worker->applyConfig(c); },
+                                  Qt::BlockingQueuedConnection);
+        QTRY_COMPARE(h.snapshot().config.fallbackTakerFee, .0009);
+        QCOMPARE(h.snapshot().makerFee, expectedMaker);
+        QCOMPARE(h.snapshot().takerFee, expectedTaker);
+        QMetaObject::invokeMethod(h.server, [&] { h.server->accountFees = {}; },
+                                  Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(h.worker, [&] { h.worker->connectExchange("fake", "fake"); },
+                                  Qt::BlockingQueuedConnection);
+        QTRY_COMPARE(h.snapshot().makerFee, c.fallbackMakerFee);
+        QTRY_VERIFY(h.snapshot().synced);
+        QCOMPARE(h.snapshot().takerFee, c.fallbackTakerFee);
     }
     void portfolioIndicatorsAndDollarGamma()
     {
@@ -1516,7 +1559,7 @@ class RuntimeTests : public QObject
                                     : Quote{99999, 100001, 100000, 100000, utcNow() - 4000};
                 s.running = alternate;
                 s.busy = i % 3 == 0;
-                s.cooldownUntil = utcNow() + (i % 3 ? 0 : 4500);
+                s.strategy = StrategyState::Quoting;
                 s.inventory = 0;
                 s.connected = alternate;
                 s.connectionStatus = alternate ? "Connected" : "Connection error";
@@ -1661,43 +1704,140 @@ class RuntimeTests : public QObject
         QVERIFY(!restored.running);
         QVERIFY(restored.anchored);
     }
-    void makerPolicies_data()
+
+
+    void restingPairHasNoTimedFallback()
     {
-        QTest::addColumn<int>("mode");
-        QTest::addColumn<int>("requests");
-        QTest::addColumn<int>("passiveAttempts");
-        QTest::newRow("balanced") << int(Execution::Balanced) << 3 << 3;
-        QTest::newRow("aggressive") << int(Execution::Aggressive) << 3 << 1;
-        QTest::newRow("custom-balanced") << int(Execution::Balanced) << 3 << 5;
-        QTest::newRow("custom-aggressive") << int(Execution::Aggressive) << 3 << 4;
-    }
-    void makerPolicies()
-    {
-        QFETCH(int, mode);
-        QFETCH(int, requests);
-        QFETCH(int, passiveAttempts);
         QTemporaryDir d;
-        QVERIFY(d.isValid());
-        RuntimeHarness h(d.filePath("core.db"), Execution(mode), true);
+        RuntimeHarness h(d.filePath("pair.db"));
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
-        QTRY_VERIFY_WITH_TIMEOUT(
-            !h.snapshot().positions.isEmpty() && h.snapshot().positions[0].hasGreeks, 5000);
-        auto c = h.snapshot().config;
-        if (Execution(mode) == Execution::Balanced)
-            c.balancedPassiveAttempts = passiveAttempts;
-        else
-            c.aggressivePassiveAttempts = passiveAttempts;
-        QMetaObject::invokeMethod(h.worker, [&, c] { h.worker->applyConfig(c); },
-                                  Qt::BlockingQueuedConnection);
         h.start();
-        QTRY_VERIFY_WITH_TIMEOUT(std::abs(h.snapshot().inventory + .01) < 1e-8, 15000);
-        QCOMPARE(h.server->mutations.load(), requests);
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().strategy == StrategyState::Quoting &&
+                                 h.snapshot().orders.size() == 3 && !h.snapshot().busy, 10000);
+        const auto initial = h.snapshot();
+        QCOMPARE(initial.inventory, -.01);
+        QVERIFY(initial.hedgeQuotes.buy.enabled && initial.hedgeQuotes.sell.enabled);
+        const int mutations = h.server->mutations.load();
+        QTest::qWait(5600);
+        QCOMPARE(h.server->mutations.load(), mutations);
+        QMetaObject::invokeMethod(h.server, [&] {
+            for (auto p : h.server->submitted) {
+                QVERIFY(p["post_only"].toBool());
+                QCOMPARE(p["time_in_force"].toString(), QString("good_til_cancelled"));
+            }
+        }, Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(h.worker, &TradingWorker::stopTrading);
+        QTRY_VERIFY_WITH_TIMEOUT(!h.snapshot().running && !h.snapshot().busy &&
+            [&] { const auto snapshot = h.snapshot();
+                  return std::all_of(snapshot.orders.begin(), snapshot.orders.end(),
+                                     [](const Order& o) { return o.terminal; }); }(), 5000);
+    }
+
+    void restingDeadbandAndBothSideFills()
+    {
+        QTemporaryDir d;
+        RuntimeHarness h(d.filePath("two-fills.db"));
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
+        h.start();
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().orders.size() == 3 && !h.snapshot().busy, 10000);
+        const auto initial = h.snapshot();
+        const int before = h.server->mutations.load();
+        QMetaObject::invokeMethod(h.server, [&] { h.server->quoteShift = 1; }, Qt::BlockingQueuedConnection);
+        QTest::qWait(900);
+        QCOMPARE(h.server->mutations.load(), before);
+        QMetaObject::invokeMethod(h.server, [&] { h.server->quoteShift = 5; }, Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() >= before + 2 && !h.snapshot().busy, 5000);
+        double expected = initial.inventory;
+        QMetaObject::invokeMethod(h.server, [&] {
+            for (auto it = h.server->byLabel.begin(); it != h.server->byLabel.end(); ++it)
+                if (it.value()["order_state"] == "open") {
+                    const double quantity = it.value()["amount"].toDouble() - it.value()["filled_amount"].toDouble();
+                    expected += (it.value()["direction"] == "buy" ? 1 : -1) * quantity;
+                    h.server->fillOrder(it.key(), quantity);
+                }
+        }, Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(std::abs(h.snapshot().inventory - expected) < Epsilon &&
+                                 h.snapshot().orders.size() >= 5 && !h.snapshot().busy, 10000);
+        const auto final = h.snapshot();
+        QVERIFY(final.running && final.synced);
+        int live = 0;
+        for (const auto& order : final.orders)
+            live += !order.terminal;
+        QCOMPARE(live, 2);
         QVERIFY(h.server->durable.load());
-        const auto orders = h.snapshot().orders;
-        QVERIFY(orders.size() >= 2);
-        QVERIFY(orders.last().ioc);
-        QVERIFY(orders.last().createdAt - orders.first().createdAt >=
-                passiveAttempts * c.makerWaitMs);
+    }
+    void failedSecondQuoteSaveStillCancelsFirstSide()
+    {
+        QTemporaryDir d;
+        const auto path = d.filePath("storage-pair.db");
+        RuntimeHarness h(path);
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
+        const QString connection = "inject-storage-pair";
+        {
+            auto db = QSqlDatabase::addDatabase("QSQLITE", connection);
+            db.setDatabaseName(path);
+            QVERIFY(db.open());
+            QSqlQuery query(db);
+            QVERIFY(query.exec("CREATE TRIGGER reject_second_quote BEFORE INSERT ON orders "
+                               "WHEN NEW.data LIKE '%\"role\":\"sell_level\"%' "
+                               "BEGIN SELECT RAISE(FAIL,'injected second quote save failure'); END"));
+            db.close();
+        }
+        QSqlDatabase::removeDatabase(connection);
+        h.start();
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().messages.join(" ").contains("injected second quote"), 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() >= 3 && !h.snapshot().busy, 5000);
+        QMetaObject::invokeMethod(h.server, [&] {
+            QCOMPARE(h.server->submitted.size(), 2); // Initial hedge and first resting side only.
+            for (const auto& order : h.server->byLabel)
+                QVERIFY(order["order_state"] != "open");
+        }, Qt::BlockingQueuedConnection);
+        QVERIFY(!h.snapshot().running);
+        QCOMPARE(h.snapshot().inventory, -.01);
+    }
+    void changedGreeksInvalidateMarginCheckedQuote()
+    {
+        QTemporaryDir d;
+        RuntimeHarness h(d.filePath("stale-preflight.db"), Execution::PostOnly, true);
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
+        QMetaObject::invokeMethod(h.server, [&] { h.server->marginDelayMs = 700; }, Qt::BlockingQueuedConnection);
+        h.start();
+        QTRY_VERIFY_WITH_TIMEOUT(h.server->marginRequests.load() > 0, 5000);
+        QMetaObject::invokeMethod(h.server, [&] { h.server->delta = .6; }, Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() == 1, 5000);
+        QMetaObject::invokeMethod(h.server, [&] {
+            QCOMPARE(h.server->submitted.size(), 1);
+            QCOMPARE(h.server->submitted.first()["amount"].toDouble(), .012);
+        }, Qt::BlockingQueuedConnection);
+        QVERIFY(h.server->durable.load());
+    }
+    void passiveHedgeAlertsWithoutCrossing()
+    {
+        QTemporaryDir d;
+        RuntimeHarness h(d.filePath("passive-alert.db"), Execution::PostOnly, true);
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
+        h.start();
+        QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() == 1, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(!h.snapshot().hedgeAlert.isEmpty(), 33000);
+        QVERIFY(h.snapshot().running);
+        QCOMPARE(h.server->mutations.load(), 1);
+        QVERIFY(h.snapshot().hedgeAlert.contains("30 s"));
+    }
+    void nonPositiveGammaCancelsBothOrders()
+    {
+        QTemporaryDir d;
+        RuntimeHarness h(d.filePath("gamma-stop.db"));
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
+        h.start();
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().orders.size() == 3 && !h.snapshot().busy, 10000);
+        QMetaObject::invokeMethod(h.server, [&] { h.server->gamma = 0; }, Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(!h.snapshot().running && !h.snapshot().busy &&
+            [&] { const auto snapshot = h.snapshot();
+                  return std::all_of(snapshot.orders.begin(), snapshot.orders.end(),
+                                     [](const Order& o) { return o.terminal; }); }(), 5000);
+        QVERIFY(h.snapshot().problem.contains("positive"));
+        QMetaObject::invokeMethod(h.worker, &TradingWorker::closeHedge);
+        QTRY_VERIFY_WITH_TIMEOUT(std::abs(h.snapshot().inventory) < Epsilon && !h.snapshot().running, 5000);
     }
     void lostCreateReplyIsRecoveredWithoutDuplicate()
     {
@@ -1713,7 +1853,9 @@ class RuntimeTests : public QObject
                                      h.snapshot().anchored &&
                                      std::abs(h.snapshot().inventory + .01) < 1e-8,
                                  20000);
-        QCOMPARE(h.server->mutations.load(), 1);
+        QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 2 && !h.snapshot().busy, 5000);
+        QCOMPARE(h.server->mutations.load(), 3);
+        QCOMPARE(h.filledCount(), 1);
     }
     void lostUnacceptedCreateIsProvedAbsentBeforeRetry_data()
     {
@@ -1743,16 +1885,17 @@ class RuntimeTests : public QObject
                                      std::abs(h.snapshot().inventory + .01) < Epsilon,
                                  30000);
         QVERIFY(h.snapshot().problem.isEmpty());
+        QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 2 && !h.snapshot().busy, 5000);
+        QCOMPARE(h.filledCount(), 1);
         QMetaObject::invokeMethod(
             h.server,
             [&]
             {
-                QCOMPARE(h.server->submitted.size(), 2);
-                QCOMPARE(h.server->byLabel.size(),
-                         1); // Only the verified replacement reached the book.
+                QCOMPARE(h.server->submitted.size(), 4);
+                QCOMPARE(h.server->byLabel.size(), 3); // Replacement hedge plus two resting orders.
                 QVERIFY(h.server->cancelledLabels.contains(
                     h.server->submitted.first()["label"].toString()));
-                QVERIFY(h.server->submitted.last()["label"] !=
+                QVERIFY(h.server->submitted[1]["label"] !=
                         h.server->submitted.first()["label"]);
             },
             Qt::BlockingQueuedConnection);
@@ -1771,6 +1914,7 @@ class RuntimeTests : public QObject
         RuntimeHarness h(path);
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
         h.start();
+        QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 2 && !h.snapshot().busy, 10000);
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().anchored && h.snapshot().running, 10000);
         Store core(path);
         const auto key = "pnl_start/" + h.snapshot().constructionId;
@@ -1784,7 +1928,7 @@ class RuntimeTests : public QObject
             },
             Qt::BlockingQueuedConnection);
         QTRY_VERIFY_WITH_TIMEOUT(!h.snapshot().running && h.snapshot().busy, 10000);
-        QCOMPARE(h.server->mutations.load(), 1);
+        QTRY_COMPARE(h.liveCount(), 0);
         if (manualStop)
         {
             QMetaObject::invokeMethod(h.worker, &TradingWorker::stopTrading);
@@ -1802,7 +1946,8 @@ class RuntimeTests : public QObject
         QCOMPARE(h.snapshot().running, !manualStop);
         QCOMPARE(h.snapshot().inventory, -.01);
         QCOMPARE(core.metadata(key), baseline);
-        QCOMPARE(h.server->mutations.load(), 1);
+        QTRY_COMPARE(h.liveCount(), manualStop ? 0 : 2);
+        QCOMPARE(h.filledCount(), 1);
     }
     void reconnectPreservesRunRequest_data()
     {
@@ -1819,13 +1964,14 @@ class RuntimeTests : public QObject
         RuntimeHarness h(d.filePath("reconnect.db"));
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
         h.start();
+        QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 2 && !h.snapshot().busy, 10000);
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().anchored && h.snapshot().running, 10000);
         if (action == "close")
         {
             QMetaObject::invokeMethod(
                 h.server, [&] { h.server->holdMaker = true; }, Qt::BlockingQueuedConnection);
             QMetaObject::invokeMethod(h.worker, &TradingWorker::closeHedge);
-            QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() == 2, 5000);
+            QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 1 && h.snapshot().strategy == StrategyState::Closing && !h.snapshot().busy, 5000);
         }
         QMetaObject::invokeMethod(
             h.server,
@@ -1866,7 +2012,7 @@ class RuntimeTests : public QObject
                     h.server,
                     [&]
                     {
-                        QCOMPARE(h.server->submitted.size(), 3);
+                        QCOMPARE(h.server->submitted.size(), 5);
                         QCOMPARE(h.server->submitted.last()["amount"].toDouble(), .006);
                         QVERIFY(h.server->submitted.last()["reduce_only"].toBool());
                     },
@@ -1875,7 +2021,8 @@ class RuntimeTests : public QObject
             else
             {
                 QCOMPARE(h.snapshot().running, action == "hedge");
-                QCOMPARE(h.server->mutations.load(), 1);
+                QTRY_COMPARE(h.liveCount(), action == "hedge" ? 2 : 0);
+                QCOMPARE(h.filledCount(), 1);
             }
         }
     }
@@ -1892,6 +2039,7 @@ class RuntimeTests : public QObject
         RuntimeHarness h(d.filePath("invalid-data.db"));
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
         h.start();
+        QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 2 && !h.snapshot().busy, 10000);
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().anchored && h.snapshot().running, 10000);
         QMetaObject::invokeMethod(
             h.server,
@@ -1902,13 +2050,14 @@ class RuntimeTests : public QObject
             },
             Qt::BlockingQueuedConnection);
         QTRY_VERIFY_WITH_TIMEOUT(!h.snapshot().running && h.snapshot().busy, 5000);
-        QCOMPARE(h.server->mutations.load(), 1);
+        QTRY_COMPARE(h.liveCount(), 0);
         QMetaObject::invokeMethod(
             h.server, [&] { h.server->invalidBid = h.server->invalidGreeks = false; },
             Qt::BlockingQueuedConnection);
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().running && !h.snapshot().busy, 10000);
         QVERIFY(h.snapshot().problem.isEmpty());
-        QCOMPARE(h.server->mutations.load(), 1);
+        QTRY_COMPARE(h.liveCount(), 2);
+        QCOMPARE(h.filledCount(), 1);
     }
     void clockDriftIsRecalibratedWhileRunning()
     {
@@ -1916,6 +2065,7 @@ class RuntimeTests : public QObject
         RuntimeHarness h(d.filePath("clock-drift.db"));
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
         h.start();
+        QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 2 && !h.snapshot().busy, 10000);
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().anchored && h.snapshot().running, 10000);
         QMetaObject::invokeMethod(
             h.server, [&] { h.server->clockLeadMs = 3500; }, Qt::BlockingQueuedConnection);
@@ -1924,24 +2074,24 @@ class RuntimeTests : public QObject
                                  12000);
         QVERIFY(h.snapshot().quote.fresh(utcNow()));
         QVERIFY(h.snapshot().problem.isEmpty());
-        QCOMPARE(h.server->mutations.load(), 1);
+        QTRY_COMPARE(h.liveCount(), 2);
+        QCOMPARE(h.filledCount(), 1);
     }
-    void wideSpreadWaitsWithoutStopping()
+    void wideSpreadOmitsTooTightLevels()
     {
         QTemporaryDir d;
-        RuntimeHarness h(d.filePath("spread.db"), Execution::Aggressive, true);
+        RuntimeHarness h(d.filePath("spread.db"));
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
-        QMetaObject::invokeMethod(
-            h.server, [&] { h.server->spreadExtra = 1000; }, Qt::BlockingQueuedConnection);
         h.start();
-        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().status == "Waiting for narrower spread", 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().strategy == StrategyState::Quoting, 10000);
+        QMetaObject::invokeMethod(h.server, [&] { h.server->spreadExtra = 2000; }, Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().hedgeQuotes.buy.reason.contains("tight") &&
+                                 h.snapshot().hedgeQuotes.sell.reason.contains("tight"), 5000);
         QVERIFY(h.snapshot().running);
-        QCOMPARE(h.server->mutations.load(), 2); // Passive create, then cancel; no wide IOC.
-        QMetaObject::invokeMethod(
-            h.server, [&] { h.server->spreadExtra = 0; }, Qt::BlockingQueuedConnection);
-        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().anchored && h.snapshot().running, 10000);
-        QCOMPARE(h.server->mutations.load(), 3);
+        QMetaObject::invokeMethod(h.server, [&] { h.server->spreadExtra = 0; }, Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().hedgeQuotes.buy.enabled && h.snapshot().hedgeQuotes.sell.enabled, 5000);
     }
+
     void transientExchangeRejectionsRetryWithoutDuplicate_data()
     {
         QTest::addColumn<int>("code");
@@ -1962,9 +2112,10 @@ class RuntimeTests : public QObject
         QTRY_VERIFY_WITH_TIMEOUT(
             h.snapshot().running && h.snapshot().anchored && !h.snapshot().busy, 10000);
         QCOMPARE(h.snapshot().inventory, -.01);
-        QCOMPARE(h.server->mutations.load(), 2);
+        QTRY_COMPARE(h.liveCount(), 2);
+        QCOMPARE(h.server->mutations.load(), 4);
         QMetaObject::invokeMethod(
-            h.server, [&] { QCOMPARE(h.server->byLabel.size(), 1); }, Qt::BlockingQueuedConnection);
+            h.server, [&] { QCOMPARE(h.server->byLabel.size(), 3); }, Qt::BlockingQueuedConnection);
     }
     void legacyProfileRebalancesWithoutAnotherDeltaEscape()
     {
@@ -1988,17 +2139,18 @@ class RuntimeTests : public QObject
         RuntimeHarness h(path, Execution::PostOnly, false, false, true, 0, -.01);
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
         QCOMPARE(h.snapshot().config.hedgePercent, 100.);
-        QCOMPARE(h.snapshot().config.execution, Execution::Balanced);
+        QVERIFY(!h.snapshot().config.json().contains("execution"));
         QVERIFY(!h.snapshot().anchored);
         h.start();
         QTRY_VERIFY_WITH_TIMEOUT(std::abs(h.snapshot().inventory + .05) < Epsilon, 10000);
-        QCOMPARE(h.server->mutations.load(), 1);
+        QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 2 && !h.snapshot().busy, 5000);
+        QCOMPARE(h.filledCount(), 1);
         QMetaObject::invokeMethod(
             h.server,
             [&]
             {
-                QCOMPARE(h.server->lastSubmitted["amount"].toDouble(), .04);
-                QVERIFY(!h.server->lastSubmitted["post_only"].toBool());
+                QCOMPARE(h.server->submitted.first()["amount"].toDouble(), .04);
+                QVERIFY(h.server->submitted.first()["post_only"].toBool());
             },
             Qt::BlockingQueuedConnection);
     }
@@ -2015,7 +2167,8 @@ class RuntimeTests : public QObject
         QTRY_VERIFY_WITH_TIMEOUT(std::abs(h.snapshot().inventory + .01) < Epsilon &&
                                      h.snapshot().synced && h.snapshot().running,
                                  12000);
-        QCOMPARE(h.server->mutations.load(), 1);
+        QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 2 && !h.snapshot().busy, 5000);
+        QCOMPARE(h.filledCount(), 1);
         QVERIFY(h.snapshot().problem.isEmpty());
     }
     void fillDuringCancelRestoresCloseHedge()
@@ -2054,6 +2207,7 @@ class RuntimeTests : public QObject
         RuntimeHarness h(path);
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
         h.start();
+        QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 2 && !h.snapshot().busy, 10000);
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().anchored, 5000);
         const auto id = h.snapshot().profileId;
         QMetaObject::invokeMethod(
@@ -2063,7 +2217,8 @@ class RuntimeTests : public QObject
         QVERIFY(!h.snapshot().running && !h.snapshot().synced);
         QCOMPARE(h.snapshot().profileId, id);
         QVERIFY(std::abs(h.snapshot().inventory + .01) < Epsilon);
-        QCOMPARE(h.server->mutations.load(), 1);
+        QTRY_COMPARE(h.liveCount(), 0);
+        QCOMPARE(h.filledCount(), 1);
         Store core(path);
         QVERIFY(!core.metadata("pnl_start/" + h.snapshot().constructionId).isEmpty());
         QCOMPARE(core.coveredQuantity(h.snapshot().orders.first().id), .01);
@@ -2098,7 +2253,8 @@ class RuntimeTests : public QObject
         QTRY_VERIFY_WITH_TIMEOUT(
             h.snapshot().anchored && std::abs(h.snapshot().inventory + .01) < Epsilon, 5000);
         QTest::qWait(800);
-        QCOMPARE(h.server->mutations.load(), 1);
+        QTRY_COMPARE(h.liveCount(), 2);
+        QCOMPARE(h.filledCount(), 1);
         Store core(path);
         QCOMPARE(core.coveredQuantity(h.snapshot().orders.first().id), .01);
         QVERIFY(h.snapshot().running);
@@ -2115,39 +2271,17 @@ class RuntimeTests : public QObject
             [&]
             {
                 h.server->rejectNextEdit = true;
-                h.server->quoteShift = 1;
+                h.server->quoteShift = -5;
             },
             Qt::BlockingQueuedConnection);
         QTRY_VERIFY_WITH_TIMEOUT(
             h.server->mutations.load() >= 3 && h.snapshot().running && h.snapshot().synced, 10000);
         QVERIFY(h.snapshot().problem.isEmpty());
+        QVERIFY(h.snapshot().messages.join(" ").contains("Post-only edit rejected"));
     }
-    void balancedUsesOrdinaryLimitsAndRetriesPartialIoc()
-    {
-        QTemporaryDir d;
-        RuntimeHarness h(d.filePath("ioc.db"), Execution::Balanced, true);
-        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
-        QMetaObject::invokeMethod(
-            h.server, [&] { h.server->partialIoc = true; }, Qt::BlockingQueuedConnection);
-        h.start();
-        QTRY_VERIFY_WITH_TIMEOUT(
-            h.snapshot().anchored && std::abs(h.snapshot().inventory + .01) < Epsilon, 15000);
-        QMetaObject::invokeMethod(
-            h.server,
-            [&]
-            {
-                QVERIFY(!h.server->submitted.first()["post_only"].toBool());
-                QCOMPARE(h.server->submitted.first()["time_in_force"].toString(),
-                         QString("good_til_cancelled"));
-                QVERIFY(h.server->submitted.size() > 2);
-                for (int i = 1; i < h.server->submitted.size(); ++i)
-                    QCOMPARE(h.server->submitted[i]["time_in_force"].toString(),
-                             QString("immediate_or_cancel"));
-            },
-            Qt::BlockingQueuedConnection);
-        QVERIFY(h.snapshot().running && h.snapshot().synced);
-    }
-    void partialCloseBeforeReversalKeepsReduceOnlyAmount()
+
+
+    void singleReversalOrderAccountsPartialFills()
     {
         QTemporaryDir d;
         const auto path = d.filePath("reverse.db");
@@ -2162,37 +2296,20 @@ class RuntimeTests : public QObject
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
         h.start();
         QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() == 1, 5000);
-        QMetaObject::invokeMethod(
-            h.server,
-            [&]
-            {
-                h.server->fillOrder(h.server->byLabel.begin().key(), .004);
-                h.server->quoteShift = 1;
-            },
-            Qt::BlockingQueuedConnection);
-        QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() >= 2, 5000);
-        QMetaObject::invokeMethod(
-            h.server,
-            [&]
-            {
-                QCOMPARE(h.server->lastEditAmount, .01);
-                h.server->fillOrder(h.server->byLabel.begin().key(), .006);
-            },
-            Qt::BlockingQueuedConnection);
-        QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() >= 3, 5000);
-        QMetaObject::invokeMethod(
-            h.server,
-            [&]
-            {
-                QVERIFY(!h.server->lastSubmitted["reduce_only"].toBool());
-                QCOMPARE(h.server->lastSubmitted["amount"].toDouble(), .01);
-                for (auto it = h.server->byLabel.begin(); it != h.server->byLabel.end(); ++it)
-                    if (it.value()["order_state"] == "open")
-                        h.server->fillOrder(it.key(), .01);
-            },
-            Qt::BlockingQueuedConnection);
-        QTRY_VERIFY_WITH_TIMEOUT(
-            h.snapshot().anchored && std::abs(h.snapshot().inventory + .01) < Epsilon, 5000);
+        QMetaObject::invokeMethod(h.server, [&] {
+            const auto label = h.server->byLabel.begin().key();
+            QCOMPARE(h.server->lastSubmitted["amount"].toDouble(), .02);
+            QCOMPARE(h.server->lastMarginAmount, .02);
+            QVERIFY(!h.server->lastSubmitted["reduce_only"].toBool());
+            h.server->fillOrder(label, .004);
+        }, Qt::BlockingQueuedConnection);
+        QTRY_VERIFY(std::abs(h.snapshot().inventory - .006) < Epsilon);
+        QMetaObject::invokeMethod(h.server, [&] {
+            const auto label = h.server->byLabel.begin().key();
+            h.server->fillOrder(label, .016);
+        }, Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().anchored && std::abs(h.snapshot().inventory + .01) < Epsilon, 5000);
+        QVERIFY(h.snapshot().running);
     }
     void postOnlyNeverCrossesAndEditIncludesPartialFill()
     {
@@ -2208,18 +2325,11 @@ class RuntimeTests : public QObject
             h.server,
             [&]
             {
-                auto it = h.server->byLabel.begin();
-                auto o = it.value();
-                o["filled_amount"] = .004;
-                o["last_update_timestamp"] = utcNow();
-                it.value() = o;
-                h.server->position = -.004;
-                h.server->notification("user.changes.BTC_USDC-PERPETUAL.100ms",
-                                       {{"orders", QJsonArray{o}}});
+                h.server->fillOrder(h.server->byLabel.begin().key(), .004);
             },
             Qt::BlockingQueuedConnection);
         QMetaObject::invokeMethod(
-            h.server, [&] { h.server->quoteShift = 1; }, Qt::BlockingQueuedConnection);
+            h.server, [&] { h.server->quoteShift = -5; }, Qt::BlockingQueuedConnection);
         QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() >= 2, 10000);
         double edited = 0;
         QMetaObject::invokeMethod(

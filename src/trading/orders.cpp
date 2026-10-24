@@ -75,6 +75,8 @@ void TradingWorker::receiveOrder(const QJsonObject& j, bool response)
     o->price = number(j, "price");
     o->updated = time;
     o->state = state;
+    o->postOnly = j["post_only"].toBool(o->postOnly);
+    o->reduceOnly = j["reduce_only"].toBool(o->reduceOnly);
     o->terminal = state != "open";
     if (response)
     {

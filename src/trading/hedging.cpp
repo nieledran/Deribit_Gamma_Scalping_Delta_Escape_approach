@@ -2,34 +2,6 @@
 #include <algorithm>
 namespace scalper
 {
-void TradingWorker::finishOperation()
-{
-    if (hedgeElapsed.isValid())
-    {
-        lastHedgeMs = hedgeElapsed.elapsed();
-        hedgeElapsed.invalidate();
-    }
-    engine.complete(utcNow());
-    if (!engine.running)
-        requested = RunRequest::None;
-    status = engine.running ? "Running" : "Paused";
-    attempts = 0;
-    while (orders.size() > Limits::RecentOrders && orders.first().terminal &&
-           !orders.first().uncertain && orders.first().mutation.isEmpty() &&
-           std::abs(store->coveredQuantity(orders.first().id) - orders.first().filled) < Epsilon)
-        orders.removeFirst();
-    save();
-    log(QString("Hedge target reached: position %1, target %2, remaining %3 %4")
-            .arg(engine.inventory, 0, 'g', 10)
-            .arg(engine.operation.target, 0, 'g', 10)
-            .arg(engine.remaining(), 0, 'g', 10)
-            .arg(engine.config.base()),
-        {{"inventory", engine.inventory},
-         {"execution_ms", lastHedgeMs},
-         {"reference_delta", engine.referenceDelta},
-         {"target", engine.operation.target},
-         {"remaining", engine.remaining()}});
-}
 void TradingWorker::pump()
 {
     if (!client || !client->authenticated() || syncing || busy || resettingProfile)
@@ -44,153 +16,175 @@ void TradingWorker::pump()
     auto* live = liveOrder();
     if (!synced)
     {
-        // A mismatch blocks new trades, but must not block cancelling verified bot orders.
-        if (!engine.running && live && !live->uncertain && !live->id.isEmpty() &&
-            live->mutation.isEmpty() && owns(*live))
-            cancelOrder(*live);
+        if (!engine.running)
+            for (auto& order : orders)
+                if (!order.terminal && !order.uncertain && !order.id.isEmpty() &&
+                    order.mutation.isEmpty() && owns(order))
+                {
+                    cancelOrder(order);
+                    break;
+                }
         return;
-    }
-    if (live && live->uncertain)
-        return;
-    if (waitingData)
-    {
-        if (live)
-            cancelOrder(*live);
-        else
-            resumeRequested();
-        return;
-    }
-    if (!engine.running)
-    {
-        if (live)
-        {
-            cancelOrder(*live);
-            return;
-        }
-        if (desiredClose)
-        {
-            desiredClose = false;
-            if (std::abs(engine.inventory) > engine.spec.step * .5)
-            {
-                engine.flattening = true;
-                engine.running = true;
-                engine.active = false;
-                attempts = 0;
-            }
-            else
-            {
-                status = "Paused";
-                requested = RunRequest::None;
-            }
-        }
-        else
-            return;
     }
     if (storageFailed)
     {
-        if (live)
-            cancelOrder(*live);
-        return;
-    }
-    if (!engine.flattening)
-    {
-        auto reason = engine.safety(utcNow());
-        if (!reason.isEmpty())
-        {
-            if (reason == engine.dataProblem(utcNow()))
-                waitForData(reason);
-            else
-                fail(reason);
-            if (live)
-                cancelOrder(*live);
-            return;
-        }
-    }
-    else if (!engine.quote.fresh(utcNow()))
-    {
-        waitForData("Fresh quote required to close hedge");
-        if (live)
-            cancelOrder(*live);
-        return;
-    }
-    if (engine.active && engine.obsolete())
-    {
-        if (live)
-        {
-            cancelOrder(*live);
-            return;
-        }
-        engine.active = false;
-        save();
-    }
-    if (!engine.active)
-    {
-        if (live)
-        {
-            cancelOrder(*live);
-            return;
-        }
-        if (utcNow() - lastFill > Time::FillRecoveryDelayMs)
-        {
-            for (const auto& o : orders)
-                if (o.filled > 0 && std::abs(store->coveredQuantity(o.id) - o.filled) > Epsilon)
-                {
-                    busy = true;
-                    recoverTrades(0, [this] { busy = false; });
-                    return;
-                }
-        }
-        qint64 previous = engine.completedAt;
-        auto next = engine.evaluate(utcNow());
-        if (next || previous != engine.completedAt)
-            save();
-        if (!next)
-        {
-            // Data can expire during the fill-accounting reads above, after the first check.
-            if (!engine.running && !engine.problem.isEmpty() && requested != RunRequest::None)
+        // An unsent create whose durable save failed must not hide the other live side.
+        for (auto& order : orders)
+            if (!order.terminal && !order.uncertain && !order.id.isEmpty() &&
+                order.mutation.isEmpty() && owns(order))
             {
-                if (engine.problem == engine.dataProblem(utcNow()) ||
-                    (requested == RunRequest::Close && !engine.quote.fresh(utcNow())))
-                    waitForData(engine.problem);
-                else
-                    fail(engine.problem);
+                cancelOrder(order);
+                break;
+            }
+        return;
+    }
+    for (const auto& o : orders)
+        if (o.uncertain || !o.mutation.isEmpty())
+            return;
+    if (waitingData || storageFailed || !engine.running)
+    {
+        if (live)
+        {
+            cancelOrder(*live);
+            return;
+        }
+        if (waitingData)
+        {
+            resumeRequested();
+            return;
+        }
+        if (storageFailed)
+            return;
+        if (!desiredClose)
+            return;
+        desiredClose = false;
+        engine.flattening = engine.running = true;
+        engine.active = false;
+    }
+    const QString reason = engine.flattening
+        ? (engine.quote.fresh(utcNow()) ? QString() : "Fresh quote required to close hedge")
+        : engine.safety(utcNow());
+    if (!reason.isEmpty())
+    {
+        if (reason == engine.dataProblem(utcNow()) || engine.flattening)
+            waitForData(reason);
+        else
+            fail(reason);
+        if (live)
+            cancelOrder(*live);
+        return;
+    }
+    // Account every cumulative fill before replacing or resizing either side.
+    if (utcNow() - lastFill > Time::FillRecoveryDelayMs)
+        for (const auto& o : orders)
+            if (o.filled > 0 && std::abs(store->coveredQuantity(o.id) - o.filled) > Epsilon)
+            {
+                busy = true;
+                recoverTrades(0, [this] { busy = false; });
                 return;
             }
-            if (!engine.running)
-            {
-                requested = RunRequest::None;
-                status = "Paused";
-            }
+    const auto priorState = engine.state;
+    engine.plan(utcNow());
+    status = strategyName(engine.state);
+    if (priorState != engine.state)
+    {
+        if (engine.active)
+        {
+            passiveSince = 0;
+            passiveAlerted = false;
+            hedgeAlert.clear();
+        }
+        save();
+        log(status, {{"inventory", engine.inventory}, {"hedge_error", engine.quotes.error}});
+    }
+    const bool passive = engine.state == StrategyState::InitialHedge ||
+                         engine.state == StrategyState::Corrective ||
+                         engine.state == StrategyState::Closing;
+    if (passive)
+    {
+        if (!passiveSince)
+            passiveSince = utcNow();
+        if (utcNow() - passiveSince >= Time::PassiveHedgeAlertMs)
+        {
+            hedgeAlert = QString("Passive hedge unfilled for 30 s; delta error %1 %2. Review exposure.")
+                             .arg(engine.quotes.error, 0, 'g', 8).arg(engine.config.base());
+            if (!passiveAlerted)
+                log(hedgeAlert);
+            passiveAlerted = true;
+        }
+    }
+    else
+    {
+        if (passiveSince)
+            lastHedgeMs = utcNow() - passiveSince;
+        passiveSince = 0;
+        passiveAlerted = false;
+        hedgeAlert.clear();
+    }
+    // First remove stale roles, crossed levels and duplicate sides. All cancellation paths
+    // revisit this pump until every affected order is terminal, including Close and Stop.
+    bool seenBuy = false, seenSell = false;
+    for (auto& o : orders)
+    {
+        if (o.terminal)
+            continue;
+        const auto& desired = o.buy ? engine.quotes.buy : engine.quotes.sell;
+        bool& seen = o.buy ? seenBuy : seenSell;
+        const bool invalid = !engine.running || !desired.enabled || o.role != desired.role || seen ||
+                             !o.postOnly || o.ioc ||
+                             (o.buy ? o.price >= engine.quote.ask : o.price <= engine.quote.bid);
+        seen = true;
+        if (invalid)
+        {
+            cancelOrder(o);
             return;
         }
-        hedgeElapsed.start();
-        log("Delta escape", {{"option_delta", next->delta},
-                             {"normalized_delta", next->normalized},
-                             {"target", next->target},
-                             {"market_at", engine.quote.at},
-                             {"bid", engine.quote.bid},
-                             {"ask", engine.quote.ask},
-                             {"engine_snapshot", engine.json()}});
-        attempts = 0;
     }
-    if (live)
+    if (!engine.running)
     {
-        if (live->mutation.isEmpty() && utcNow() - live->attemptAt >= engine.config.makerWaitMs)
+        requested = RunRequest::None;
+        save();
+        return;
+    }
+    // Reductions precede increases; preserve a price within the three-tick deadband.
+    for (bool reductions : {true, false})
+        for (auto& o : orders)
         {
-            ++attempts;
-            const int passiveAttempts = engine.config.passiveAttempts();
-            const bool aggressive = passiveAttempts > 0 && attempts >= passiveAttempts;
-            editOrder(*live, aggressive);
+            if (o.terminal)
+                continue;
+            auto desired = o.buy ? engine.quotes.buy : engine.quotes.sell;
+            const double remaining = std::max(0.0, o.total - o.filled);
+            const bool reducing = engine.inventory * (o.buy ? 1 : -1) < 0 &&
+                                  desired.amount <= std::abs(engine.inventory) + Epsilon;
+            const bool less = desired.amount < remaining - engine.spec.step * .1;
+            if (less != reductions)
+                continue;
+            if (std::abs(desired.price - o.price) < engine.spec.tickAt(o.price) * Limits::QuoteDeadbandTicks)
+                desired.price = o.price;
+            if (std::abs(desired.price - o.price) > engine.spec.tickAt(o.price) * .1 ||
+                std::abs(desired.amount - remaining) > engine.spec.step * .1 || reducing != o.reduceOnly)
+            {
+                editOrder(o, desired);
+                return;
+            }
         }
-        return;
-    }
-    if (std::abs(engine.remaining()) < engine.spec.step * .5)
+    // Restoring a missing side comes after existing orders have been made safe.
+    for (const auto& desired : {engine.quotes.buy, engine.quotes.sell})
     {
-        finishOperation();
-        return;
+        if (!desired.enabled)
+            continue;
+        bool found = false;
+        for (const auto& o : orders)
+            found |= !o.terminal && o.buy == desired.buy;
+        if (!found)
+        {
+            submitNew(desired);
+            return;
+        }
     }
-    const int passiveAttempts = engine.config.passiveAttempts();
-    const bool aggressive = passiveAttempts > 0 && attempts >= passiveAttempts;
-    submitNew(aggressive);
+    while (orders.size() > Limits::RecentOrders && orders.first().terminal &&
+           !orders.first().uncertain && orders.first().mutation.isEmpty() &&
+           std::abs(store->coveredQuantity(orders.first().id) - orders.first().filled) < Epsilon)
+        orders.removeFirst();
 }
 } // namespace scalper
