@@ -166,6 +166,8 @@ void Hedger::restore(const QJsonObject& j)
             "Unsupported gamma profile version; grid profiles cannot be imported");
     config = Config::fromJson(j["config"].toObject());
     inventory = number(j, "inventory");
+    if (std::abs(inventory) < Epsilon)
+        inventory = 0;
     referenceDelta = number(j, "reference_delta");
     // Removing the old cap changes the target even if option delta has not moved.
     anchored = j["config"].toObject().contains("hedge_percent") && j["anchored"].toBool();

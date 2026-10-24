@@ -15,6 +15,7 @@
 #include <QPlainTextEdit>
 #include <QPointer>
 #include <QPushButton>
+#include <QSpinBox>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QThread>
@@ -55,6 +56,7 @@ class Window : public QMainWindow
                    *makerWait = nullptr, *slippage = nullptr;
     QCheckBox* marginEnabled = nullptr;
     QComboBox* execution = nullptr;
+    QSpinBox *balancedAttempts = nullptr, *aggressiveAttempts = nullptr;
     QTableWidget *positions = nullptr, *pnl = nullptr, *orders = nullptr;
     QTabWidget* tabs = nullptr;
     QLabel *status = nullptr, *latency = nullptr, *risk = nullptr, *estimate = nullptr,
@@ -62,7 +64,7 @@ class Window : public QMainWindow
            *marginInfo = nullptr;
     QLabel *dataAge = nullptr, *clockDifference = nullptr;
     QLabel *netDeltaValue = nullptr, *hedgeValue = nullptr, *hedgeUsage = nullptr,
-           *normalizedValue = nullptr, *referenceValue = nullptr, *escapeValue = nullptr,
+           *normalizedValue = nullptr, *referenceValue = nullptr,
            *legsValue = nullptr, *activity = nullptr, *executionState = nullptr,
            *pnlCoverage = nullptr, *pnlPeriod = nullptr, *hedgeRemaining = nullptr,
            *targetDeltaValue = nullptr;

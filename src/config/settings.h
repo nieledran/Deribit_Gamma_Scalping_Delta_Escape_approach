@@ -42,6 +42,7 @@ inline constexpr double MaxMarginUsagePercent = 99.99;
 inline constexpr int MinOperationIntervalMs = 500;
 inline constexpr int MaxCooldownMs = Time::HourMs;
 inline constexpr int MaxMakerWaitMs = Time::MinuteMs;
+inline constexpr int MaxPassiveAttempts = 100;
 inline constexpr int RecentOrders = 100;
 inline constexpr int JournalMessages = 200;
 inline constexpr double BasisPoints = 10000;

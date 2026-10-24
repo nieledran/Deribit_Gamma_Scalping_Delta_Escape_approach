@@ -3,6 +3,7 @@
 #include "ui/format.h"
 #include "ui/theme.h"
 #include "ui/window.h"
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QJsonDocument>
 #include <QMenu>
@@ -403,7 +404,7 @@ class FakeDeribit : public QObject
             lastSubmitted = p;
             submitted.append(p);
             const double amount = p["amount"].toDouble();
-            if (amount != roundDown(amount, fixtures::perpetual().step))
+            if (amount <= 0 || amount != roundDown(amount, fixtures::perpetual().step))
             {
                 ++invalidAmounts;
                 socket->sendTextMessage(QString::fromUtf8(
@@ -891,11 +892,22 @@ class RuntimeTests : public QObject
         auto* cooldown = window.findChild<QDoubleSpinBox*>("cooldown");
         QVERIFY(!window.findChild<QDialog*>("advancedDialog")->isAncestorOf(cooldown));
         cooldown->setValue(2.3);
+        auto* advanced = window.findChild<QDialog*>("advancedDialog");
+        auto* balanced = window.findChild<QSpinBox*>("balancedPassiveAttempts");
+        auto* aggressive = window.findChild<QSpinBox*>("aggressivePassiveAttempts");
+        QVERIFY(advanced->isAncestorOf(balanced));
+        QVERIFY(advanced->isAncestorOf(aggressive));
+        balanced->setValue(4);
+        aggressive->setValue(2);
+        window.findChild<QDoubleSpinBox*>("makerWait")->setValue(5);
         auto* apply = window.findChild<QPushButton*>("applySettings");
         QTRY_VERIFY(apply->property("pendingChanges").toBool());
         QCOMPARE(apply->text(), QString("Apply"));
         apply->click();
         QTRY_COMPARE(snapshot().config.cooldownMs, 2300);
+        QTRY_COMPARE(snapshot().config.balancedPassiveAttempts, 4);
+        QCOMPARE(snapshot().config.aggressivePassiveAttempts, 2);
+        QCOMPARE(snapshot().config.makerWaitMs, 5000);
         QTRY_VERIFY(!apply->property("pendingChanges").toBool());
         window.findChild<QPushButton*>("start")->click();
         QTRY_VERIFY_WITH_TIMEOUT(std::abs(snapshot().inventory + .01) < 1e-8, 10000);
@@ -960,6 +972,65 @@ class RuntimeTests : public QObject
             h.server, [&] { sent = h.server->lastSubmitted; }, Qt::BlockingQueuedConnection);
         QCOMPARE(sent["amount"].toDouble(), .0086);
         QVERIFY(sent["reduce_only"].toBool());
+        QCOMPARE(h.snapshot().inventory, 0.);
+    }
+    void reversalDoesNotSubmitZeroAmount_data()
+    {
+        QTest::addColumn<double>("inventory");
+        QTest::addColumn<double>("delta");
+        QTest::newRow("long-to-short") << .0017000000000000036 << .5;
+        QTest::newRow("short-to-long") << -.0017000000000000036 << -.5;
+        QTest::newRow("restored-positive-dust") << 3.686287386450715e-18 << .5;
+        QTest::newRow("restored-negative-dust") << -3.686287386450715e-18 << -.5;
+    }
+    void reversalDoesNotSubmitZeroAmount()
+    {
+        QFETCH(double, inventory);
+        QFETCH(double, delta);
+        QTemporaryDir directory;
+        const auto path = directory.filePath("reversal.db");
+        {
+            Store store(path);
+            auto engine = fixtures::engine(utcNow());
+            engine.inventory = inventory;
+            engine.config.hedgePercent = 3.8;
+            engine.config.deltaChange = .04; // Keep this small basket above the minimum hedge lot.
+            engine.config.execution = Execution::Balanced;
+            store.bind("123/testnet/BTC_USDC-PERPETUAL");
+            store.save(engine, {});
+        }
+        RuntimeHarness h(path, Execution::Balanced, false, false, true, 0, inventory);
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
+        QMetaObject::invokeMethod(
+            h.server, [&] { h.server->delta = delta; }, Qt::BlockingQueuedConnection);
+        QTRY_COMPARE(h.snapshot().positions[0].delta, delta);
+        if (std::abs(inventory) < Epsilon)
+            QCOMPARE(h.snapshot().inventory, 0.);
+        h.start();
+        const double target = delta > 0 ? -.0019 : .0019;
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().anchored && h.snapshot().running &&
+                                     !h.snapshot().busy &&
+                                     std::abs(h.snapshot().inventory - target) < Epsilon,
+                                 10000);
+        QCOMPARE(h.server->invalidAmounts.load(), 0);
+        QVERIFY(h.snapshot().problem.isEmpty());
+        QMetaObject::invokeMethod(
+            h.server,
+            [&]
+            {
+                const bool hadPosition = std::abs(inventory) > Epsilon;
+                QCOMPARE(h.server->submitted.size(), hadPosition ? 2 : 1);
+                if (hadPosition)
+                {
+                    const auto first = h.server->submitted.first();
+                    QCOMPARE(first["amount"].toDouble(), .0017);
+                    QVERIFY(first["reduce_only"].toBool());
+                }
+                const auto last = h.server->submitted.last();
+                QCOMPARE(last["amount"].toDouble(), .0019);
+                QVERIFY(!last["reduce_only"].toBool());
+            },
+            Qt::BlockingQueuedConnection);
     }
     void connectedUiStartsOnePersistentPnlPeriod()
     {
@@ -1021,11 +1092,55 @@ class RuntimeTests : public QObject
         auto* executionPanel = window.findChild<QWidget*>("executionPanel");
         QCOMPARE(executionPanel->geometry().top(), deltaPanel->geometry().top());
         QCOMPARE(executionPanel->height(), deltaPanel->height());
+        auto* rebalance = window.findChild<QLabel*>("rebalanceBand");
+        QCOMPARE(rebalance->parentWidget(), executionPanel);
+        auto* breakEven = window.findChild<QLabel*>("breakEvenMove");
+        QCOMPARE(breakEven->parentWidget(), executionPanel);
+        QVERIFY(!window.findChild<QLabel*>("escapeDelta"));
+        QCOMPARE(window.findChild<QLabel*>("tradingActivity")->y(),
+                 window.findChild<QLabel*>("normalizedDelta")->y());
+        QCOMPARE(rebalance->y(), window.findChild<QLabel*>("referenceDelta")->y());
+        QCOMPARE(breakEven->y(), window.findChild<QLabel*>("targetNetDelta")->y());
         auto* bid = window.findChild<QWidget*>("bidQuote");
         auto* ask = window.findChild<QWidget*>("askQuote");
         auto* middle = window.findChild<QLabel*>("riskSummary");
         QVERIFY(bid->x() < ask->x() && ask->x() < middle->x());
         QVERIFY(middle->text().startsWith("Middle Price:"));
+    }
+    void advancedAttemptCountsAndCompactDialog()
+    {
+        Window window("", Config{}, true);
+        window.show();
+        auto* advanced = window.findChild<QDialog*>("advancedDialog");
+        auto* mode = window.findChild<QComboBox*>("executionMode");
+        auto* balanced = window.findChild<QSpinBox*>("balancedPassiveAttempts");
+        auto* aggressive = window.findChild<QSpinBox*>("aggressivePassiveAttempts");
+        auto* duration = window.findChild<QDoubleSpinBox*>("makerWait");
+        QCOMPARE(duration->value(), 5.);
+        QTimer::singleShot(1000, advanced, &QDialog::reject);
+        QTimer::singleShot(50, &window,
+                           [&]
+                           {
+                               QVERIFY(balanced->isVisible());
+                               QCOMPARE(balanced->value(), 3);
+                               mode->setCurrentIndex(int(Execution::Aggressive));
+                               QVERIFY(aggressive->isVisible());
+                               QCOMPARE(aggressive->value(), 1);
+                               aggressive->setValue(2);
+                               mode->setCurrentIndex(int(Execution::Balanced));
+                               QCOMPARE(balanced->value(), 3);
+                               balanced->setValue(4);
+                               duration->setValue(7);
+                               auto* buttons = advanced->findChild<QDialogButtonBox*>();
+                               QVERIFY(advanced->width() >= 450);
+                               QVERIFY(advanced->height() - buttons->geometry().bottom() <= 16);
+                               advanced->reject();
+                           });
+        window.findChild<QPushButton*>("advanced")->click();
+        QCOMPARE(balanced->value(), 3);
+        QCOMPARE(aggressive->value(), 1);
+        QCOMPARE(duration->value(), 5.);
+        QCOMPARE(mode->currentIndex(), int(Execution::Balanced));
     }
     void portfolioIndicatorsAndDollarGamma()
     {
@@ -1049,9 +1164,10 @@ class RuntimeTests : public QObject
         QVERIFY(band->toolTip().contains("commission"));
         auto* table = window.findChild<QTableWidget*>("optionPositions");
         QCOMPARE(table->columnCount(), 9);
-        QCOMPARE(table->horizontalHeaderItem(4)->text(), QString("Dollar Gamma"));
-        QCOMPARE(table->item(0, 4)->text().toDouble(), 25000.);
-        QCOMPARE(table->item(1, 4)->text().toDouble(), -12500.);
+        QCOMPARE(table->horizontalHeaderItem(4)->text(), QString("Gamma P&L (1%)"));
+        QCOMPARE(table->item(0, 4)->text().toDouble(), 2.5);
+        QCOMPARE(table->item(1, 4)->text().toDouble(), -1.25);
+        QVERIFY(table->item(0, 4)->toolTip().contains("25000"));
         QCOMPARE(table->item(2, 4)->text(), QString("0"));
         QCOMPARE(table->item(0, 5)->text().toDouble(), -20.);
         QCOMPARE(table->item(0, 7)->text().toDouble(), 6000.);
@@ -1375,7 +1491,7 @@ class RuntimeTests : public QObject
             "riskSummary",     "bidQuote",        "askQuote",        "rebalanceBand",
             "breakEvenMove",   "pnlCoverage",     "hedgeEstimate",   "netDeltaValue",
             "hedgeValue",      "hedgeUsage",      "normalizedDelta", "referenceDelta",
-            "escapeDelta",     "legsValue",       "tradingActivity", "latencyStatus",
+            "legsValue",       "tradingActivity", "latencyStatus",
             "quoteAge",        "clockDifference", "dataQuality",     "connectionStatus",
             "optionPositions", "connect",         "advanced",        "actions",
             "pnlPanel",        "executionState",  "marketPanel",     "deltaPanel",
@@ -1549,23 +1665,39 @@ class RuntimeTests : public QObject
     {
         QTest::addColumn<int>("mode");
         QTest::addColumn<int>("requests");
-        QTest::newRow("balanced") << int(Execution::Balanced) << 3;
-        QTest::newRow("aggressive") << int(Execution::Aggressive) << 3;
+        QTest::addColumn<int>("passiveAttempts");
+        QTest::newRow("balanced") << int(Execution::Balanced) << 3 << 3;
+        QTest::newRow("aggressive") << int(Execution::Aggressive) << 3 << 1;
+        QTest::newRow("custom-balanced") << int(Execution::Balanced) << 3 << 5;
+        QTest::newRow("custom-aggressive") << int(Execution::Aggressive) << 3 << 4;
     }
     void makerPolicies()
     {
         QFETCH(int, mode);
         QFETCH(int, requests);
+        QFETCH(int, passiveAttempts);
         QTemporaryDir d;
         QVERIFY(d.isValid());
         RuntimeHarness h(d.filePath("core.db"), Execution(mode), true);
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
         QTRY_VERIFY_WITH_TIMEOUT(
             !h.snapshot().positions.isEmpty() && h.snapshot().positions[0].hasGreeks, 5000);
+        auto c = h.snapshot().config;
+        if (Execution(mode) == Execution::Balanced)
+            c.balancedPassiveAttempts = passiveAttempts;
+        else
+            c.aggressivePassiveAttempts = passiveAttempts;
+        QMetaObject::invokeMethod(h.worker, [&, c] { h.worker->applyConfig(c); },
+                                  Qt::BlockingQueuedConnection);
         h.start();
         QTRY_VERIFY_WITH_TIMEOUT(std::abs(h.snapshot().inventory + .01) < 1e-8, 15000);
         QCOMPARE(h.server->mutations.load(), requests);
         QVERIFY(h.server->durable.load());
+        const auto orders = h.snapshot().orders;
+        QVERIFY(orders.size() >= 2);
+        QVERIFY(orders.last().ioc);
+        QVERIFY(orders.last().createdAt - orders.first().createdAt >=
+                passiveAttempts * c.makerWaitMs);
     }
     void lostCreateReplyIsRecoveredWithoutDuplicate()
     {

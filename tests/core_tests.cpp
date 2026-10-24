@@ -82,6 +82,43 @@ class CoreTests : public QObject
         e.options[0].delta = .501;
         QCOMPARE(e.target(), -.025);
     }
+    void passiveExecutionSettingsPersistAndMigrate()
+    {
+        auto c = fixtures::engine(utcNow()).config;
+        QCOMPARE(c.makerWaitMs, 5000);
+        QCOMPARE(c.passiveAttempts(), 3);
+        c.execution = Execution::Aggressive;
+        QCOMPARE(c.passiveAttempts(), 1);
+        c.execution = Execution::PostOnly;
+        QCOMPARE(c.passiveAttempts(), 0);
+        c.balancedPassiveAttempts = 7;
+        c.aggressivePassiveAttempts = 2;
+        c.makerWaitMs = 6500;
+        auto saved = c.json();
+        const auto restored = Config::fromJson(saved);
+        QCOMPARE(restored.balancedPassiveAttempts, 7);
+        QCOMPARE(restored.aggressivePassiveAttempts, 2);
+        QCOMPARE(restored.makerWaitMs, 6500);
+        QVERIFY(restored.validate().isEmpty());
+        saved.remove("balanced_passive_attempts");
+        saved.remove("aggressive_passive_attempts");
+        saved["maker_wait_ms"] = 2000;
+        const auto migrated = Config::fromJson(saved);
+        QCOMPARE(migrated.balancedPassiveAttempts, 3);
+        QCOMPARE(migrated.aggressivePassiveAttempts, 1);
+        QCOMPARE(migrated.makerWaitMs, 2000);
+        saved.remove("maker_wait_ms");
+        QCOMPARE(Config::fromJson(saved).makerWaitMs, 5000);
+        for (int invalid : {0, -1, Limits::MaxPassiveAttempts + 1})
+        {
+            c.balancedPassiveAttempts = invalid;
+            QVERIFY(!c.validate().isEmpty());
+            c.balancedPassiveAttempts = 3;
+            c.aggressivePassiveAttempts = invalid;
+            QVERIFY(!c.validate().isEmpty());
+            c.aggressivePassiveAttempts = 1;
+        }
+    }
     void minimumDeltaChangeIncludesCoverage()
     {
         auto e = fixtures::engine(1000000000);

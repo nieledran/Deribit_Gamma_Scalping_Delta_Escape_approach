@@ -65,6 +65,12 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
     if (!owns(order))
         throw std::runtime_error("Order ownership is unverified");
     bool cancel = method == "private/cancel";
+    if (!cancel)
+    {
+        const double amount = number(params, "amount");
+        if (amount < engine.spec.step * .5 || amount != roundDown(amount, engine.spec.step))
+            throw std::runtime_error("Hedge order amount must be positive and match the lot step");
+    }
     if (!cancel && engine.running)
         status = engine.flattening ? "Closing hedge" : "Running";
     order.mutation = method;
@@ -107,14 +113,25 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
                         return;
                     if (!r.ok)
                     {
-                        log(QString("%1 failed: code %2, %3 (order %4)")
+                        log(QString("%1 failed: code %2, %3 (order %4); amount %5, step %6, "
+                                    "position %7, target %8")
                                 .arg(method)
                                 .arg(r.code)
-                                .arg(r.error, label),
+                                .arg(r.error, label)
+                                .arg(o->request.contains("amount")
+                                         ? QString::number(o->request["amount"].toDouble(), 'g', 12)
+                                         : "n/a")
+                                .arg(engine.spec.step, 0, 'g', 12)
+                                .arg(engine.inventory, 0, 'g', 12)
+                                .arg(engine.operation.target, 0, 'g', 12),
                             {{"method", method},
                              {"code", r.code},
                              {"reason", r.error},
                              {"label", label},
+                             {"request", o->request},
+                             {"step", engine.spec.step},
+                             {"inventory", engine.inventory},
+                             {"target", engine.operation.target},
                              {"uncertain", r.uncertain}});
                         if (r.uncertain)
                         {
@@ -213,15 +230,17 @@ void TradingWorker::submitNew(bool aggressive)
     double remaining = engine.remaining();
     bool buy = remaining > 0;
     double qty = roundDown(std::abs(remaining), engine.spec.step);
+    // A floating-point remainder after closing is not an opposite position.
+    bool reducing =
+        std::abs(engine.inventory) >= engine.spec.step * .5 && engine.inventory * remaining < 0;
+    // Re-quantize the accumulated position before serializing a reduce-only amount.
+    if (reducing)
+        qty = roundDown(std::min(qty, std::abs(engine.inventory)), engine.spec.step);
     if (qty < engine.spec.step * .5)
     {
         finishOperation();
         return;
     }
-    bool reducing = engine.inventory * remaining < 0;
-    if (reducing)
-        qty = roundDown(std::min(qty, std::abs(engine.inventory)), engine.spec.step);
-    // Re-quantize the accumulated position before serializing a reduce-only amount.
     double mid = engine.quote.mid();
     double p = aggressive ? (buy ? engine.quote.ask : engine.quote.bid)
                           : (buy ? engine.quote.bid : engine.quote.ask);
@@ -285,13 +304,13 @@ void TradingWorker::editOrder(Order& o, bool aggressive)
         return;
     }
     double qty = roundDown(std::abs(remaining), engine.spec.step);
+    if (o.reduceOnly)
+        qty = roundDown(std::min(qty, std::abs(engine.inventory)), engine.spec.step);
     if (qty < engine.spec.step * .5)
     {
         cancelOrder(o);
         return;
     }
-    if (o.reduceOnly)
-        qty = roundDown(std::min(qty, std::abs(engine.inventory)), engine.spec.step);
     double total = roundDown(o.filled + qty, engine.spec.step);
     o.attemptAt = utcNow();
     if (std::abs(o.price - p) < engine.spec.tickAt(p) * .1 &&

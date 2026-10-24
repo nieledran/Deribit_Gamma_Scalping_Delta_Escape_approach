@@ -178,9 +178,8 @@ void TradingWorker::pump()
         if (live->mutation.isEmpty() && utcNow() - live->attemptAt >= engine.config.makerWaitMs)
         {
             ++attempts;
-            bool aggressive = engine.config.execution == Execution::Aggressive
-                                  ? attempts >= 1
-                                  : engine.config.execution == Execution::Balanced && attempts >= 2;
+            const int passiveAttempts = engine.config.passiveAttempts();
+            const bool aggressive = passiveAttempts > 0 && attempts >= passiveAttempts;
             editOrder(*live, aggressive);
         }
         return;
@@ -190,9 +189,8 @@ void TradingWorker::pump()
         finishOperation();
         return;
     }
-    bool aggressive = engine.config.execution == Execution::Aggressive
-                          ? attempts >= 1
-                          : engine.config.execution == Execution::Balanced && attempts >= 2;
+    const int passiveAttempts = engine.config.passiveAttempts();
+    const bool aggressive = passiveAttempts > 0 && attempts >= passiveAttempts;
     submitNew(aggressive);
 }
 } // namespace scalper

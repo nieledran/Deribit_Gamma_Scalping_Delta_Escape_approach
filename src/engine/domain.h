@@ -33,14 +33,21 @@ struct Config
     bool production = false;
     bool marginLimitEnabled = false;
     QStringList selected;
-    double deltaChange = .04, hedgePercent = 100, maxMarginUsage = 0, slippageBps = 5;
-    int cooldownMs = 10000, makerWaitMs = 2000;
+    double deltaChange = .01, hedgePercent = 100, maxMarginUsage = 0, slippageBps = 5;
+    int cooldownMs = 10000, makerWaitMs = 5000;
+    int balancedPassiveAttempts = 3, aggressivePassiveAttempts = 1;
     Execution execution = Execution::Balanced;
     QString base() const
     {
         return instrument.startsWith("ETH") ? "ETH" : "BTC";
     }
     QString validate() const;
+    int passiveAttempts() const
+    {
+        return execution == Execution::PostOnly ? 0
+               : execution == Execution::Balanced ? balancedPassiveAttempts
+                                                  : aggressivePassiveAttempts;
+    }
     QJsonObject json() const;
     static Config fromJson(const QJsonObject& json);
 };

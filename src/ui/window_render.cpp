@@ -212,7 +212,6 @@ void Window::render()
                                (ready && greeksReady ? displayNumber(g.normalized(), 4) : missing));
     label(referenceValue, "Reference delta: " +
                               (ready && s.anchored ? displayNumber(s.referenceDelta, 4) : missing));
-    label(escapeValue, "Escape threshold: " + displayNumber(s.config.deltaChange, 4));
     label(legsValue, QString("%1 options + %2 perpetual")
                          .arg(s.config.selected.size())
                          .arg(std::abs(s.inventory) > Epsilon ? 1 : 0));
@@ -254,13 +253,15 @@ void Window::render()
                  true);
             cell(positions, row, 3, o.hasGreeks ? displayNumber(o.quantity * o.gamma, 9) : missing,
                  true);
+            const double dollarGamma = .5 * o.quantity * o.gamma * s.quote.mid() * s.quote.mid();
             cell(positions, row, 4,
-                 o.hasGreeks && validPrice
-                     ? displayNumber(.5 * o.quantity * o.gamma * s.quote.mid() * s.quote.mid(), 2)
-                     : missing,
-                 true);
+                 o.hasGreeks && validPrice ? displayNumber(dollarGamma * .0001, 2) : missing, true);
             positions->item(row, 4)->setToolTip(
                 positions->horizontalHeaderItem(4)->toolTip() +
+                (o.hasGreeks && validPrice
+                     ? "\nDollar Gamma (0.5 x position gamma x Middle Price^2): $" +
+                           displayNumber(dollarGamma, 2)
+                     : QString()) +
                 (!demo && (!o.freshGreeks(now) || !s.quote.fresh(now))
                      ? "\nLast available prices/Greeks; data is stale."
                      : ""));

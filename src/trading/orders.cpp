@@ -62,6 +62,8 @@ void TradingWorker::receiveOrder(const QJsonObject& j, bool response)
     double change = filled - o->filled;
     const bool changedState = o->id.isEmpty() || o->state != state;
     engine.inventory += change * (o->buy ? 1 : -1);
+    if (std::abs(engine.inventory) < Epsilon)
+        engine.inventory = 0;
     if (change > Epsilon)
     {
         ++positionRevision;

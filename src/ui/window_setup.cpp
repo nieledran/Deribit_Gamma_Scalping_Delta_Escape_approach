@@ -8,6 +8,7 @@
 #include <QGridLayout>
 #include <QHeaderView>
 #include <QMenu>
+#include <QStackedWidget>
 #include <QVBoxLayout>
 namespace scalper
 {
@@ -250,8 +251,8 @@ void Window::setupUi()
     auto* quotes = new QGridLayout(marketPanel);
     quotes->setContentsMargins(8, 4, 8, 4);
     // Fixed column proportions: text changes never resize neighbouring fields.
-    const int quoteWidths[] = {105, 105, 158, 8, 190, 190};
-    for (int col = 0; col < 6; ++col)
+    const int quoteWidths[] = {105, 105, 158};
+    for (int col = 0; col < 3; ++col)
         quotes->setColumnStretch(col, quoteWidths[col]);
     risk = new StableLabel;
     risk->setObjectName("riskSummary");
@@ -262,13 +263,6 @@ void Window::setupUi()
     askQuote->setObjectName("askQuote");
     quotes->addWidget(bidQuote, 0, 0);
     quotes->addWidget(askQuote, 0, 1);
-    quotes->addWidget(new QLabel("|"), 0, 3);
-    rebalanceBand = new StableLabel;
-    rebalanceBand->setObjectName("rebalanceBand");
-    quotes->addWidget(rebalanceBand, 0, 4);
-    breakEvenMove = new StableLabel;
-    breakEvenMove->setObjectName("breakEvenMove");
-    quotes->addWidget(breakEvenMove, 0, 5);
     layout->addWidget(marketPanel);
     auto* metrics = new QHBoxLayout;
     metrics->setSpacing(3);
@@ -313,25 +307,27 @@ void Window::setupUi()
     stateRow->addWidget(estimate, 0, 0);
     stateRow->addWidget(executionState, 0, 1);
     executionFields->addLayout(stateRow, 0, 0);
-    escapeValue = metric(executionFields, 1, "escapeDelta");
-    activity = metric(executionFields, 2, "tradingActivity");
-    executionFields->setRowStretch(3, 1);
+    activity = metric(executionFields, 1, "tradingActivity");
+    rebalanceBand = metric(executionFields, 2, "rebalanceBand");
+    breakEvenMove = metric(executionFields, 3, "breakEvenMove");
     layout->addLayout(metrics);
     tabs = new QTabWidget;
     tabs->setObjectName("mainTabs");
     positions = table(
-        {"Instrument", "Qty", "Delta", "Gamma", "Dollar Gamma", "Theta", "Vega", "Mark", "Data"});
+        {"Instrument", "Qty", "Delta", "Gamma", "Gamma P&L (1%)", "Theta", "Vega", "Mark", "Data"});
     positions->setObjectName("optionPositions");
     positions->horizontalHeader()->setStretchLastSection(false);
     positions->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    const int widths[] = {0, 65, 80, 85, 95, 65, 65, 75, 50};
+    const int widths[] = {0, 65, 80, 85, 120, 65, 65, 75, 50};
     for (int col = 1; col < 9; ++col)
         positions->setColumnWidth(col, widths[col]);
     positions->horizontalHeaderItem(2)->setToolTip("Position delta (coin)");
     positions->horizontalHeaderItem(3)->setToolTip("Position gamma (coin per USD)");
     positions->horizontalHeaderItem(4)->setToolTip(
-        "0.5 x position gamma x Middle Price squared (USD). Multiply by the squared fractional "
-        "price move: for 1%, multiply this value by 0.0001. Signed quantity included.");
+        "Approximate gamma-only P&L in USD for a 1% price move in either direction: "
+        "0.5 x position gamma x (0.01 x Middle Price)^2. Signed quantity included. "
+        "Constant gamma; excludes delta, theta, IV changes and trading costs. "
+        "The original Dollar Gamma coefficient is available in each cell's tooltip.");
     positions->horizontalHeaderItem(5)->setToolTip(
         "Position theta (USD, API remaining-lifetime cap)");
     positions->horizontalHeaderItem(6)->setToolTip("Position vega (USD per volatility point)");
@@ -427,6 +423,7 @@ void Window::setupDialogs()
     advancedDialog->setWindowTitle("Advanced settings");
     advancedDialog->setMinimumWidth(450);
     auto* advanced = new QFormLayout(advancedDialog);
+    advanced->setSizeConstraint(QLayout::SetFixedSize);
     auto add = [&](const QString& title, double min, double max, int decimals, const QString& name)
     {
         auto* box = new CompactSpinBox;
@@ -442,6 +439,25 @@ void Window::setupDialogs()
                          executionName(Execution::Aggressive)});
     advanced->addRow("Execution:", execution);
     connect(execution, &QComboBox::currentIndexChanged, this, [this] { markDirty(); });
+    auto* attempts = new QStackedWidget;
+    attempts->setObjectName("passiveAttempts");
+    attempts->setToolTip("Number of passive attempts before switching to crossing limit IOC.\n"
+                         "Saved separately for Balanced and Aggressive. POST-ONLY stays passive.");
+    attempts->addWidget(new QLabel("Unlimited"));
+    auto attemptCount = [&](const char* name)
+    {
+        auto* box = new QSpinBox;
+        box->setObjectName(name);
+        box->setRange(1, Limits::MaxPassiveAttempts);
+        attempts->addWidget(box);
+        connect(box, qOverload<int>(&QSpinBox::valueChanged), this, [this] { markDirty(); });
+        return box;
+    };
+    balancedAttempts = attemptCount("balancedPassiveAttempts");
+    aggressiveAttempts = attemptCount("aggressivePassiveAttempts");
+    advanced->addRow("Passive attempts:", attempts);
+    connect(execution, &QComboBox::currentIndexChanged, attempts, &QStackedWidget::setCurrentIndex);
+    attempts->setCurrentIndex(execution->currentIndex());
     makerWait =
         add("Passive attempt (s):", .5, double(Limits::MaxMakerWaitMs) / 1000, 1, "makerWait");
     slippage = add("Slippage limit (bps):", .01, Limits::MaxSlippageBps, 2, "slippage");
@@ -451,13 +467,9 @@ void Window::setupDialogs()
     margin = add("MM / Margin Balance (%):", .01, 99.99, 2, "maxMarginUsage");
     marginInfo = new QLabel("Account margin data unavailable");
     marginInfo->setWordWrap(true);
+    const auto margins = advanced->contentsMargins();
+    marginInfo->setMinimumWidth(advancedDialog->minimumWidth() - margins.left() - margins.right());
     advanced->addRow(marginInfo);
-    auto* note =
-        new QLabel("The threshold pauses trading and cancels bot orders; positions remain.\n"
-                   "Reducing the perpetual can increase portfolio margin requirements.\n"
-                   "Changes are saved with Apply in the main window.");
-    note->setWordWrap(true);
-    advanced->addRow(note);
     auto* done = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     advanced->addRow(done);
     connect(done, &QDialogButtonBox::accepted, advancedDialog, &QDialog::accept);

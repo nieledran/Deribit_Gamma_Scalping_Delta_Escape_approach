@@ -69,6 +69,8 @@ void Window::populateConfig(const Config& c)
     margin->setEnabled(c.marginLimitEnabled);
     cooldown->setValue(c.cooldownMs / 1000.0);
     makerWait->setValue(c.makerWaitMs / 1000.0);
+    balancedAttempts->setValue(c.balancedPassiveAttempts);
+    aggressiveAttempts->setValue(c.aggressivePassiveAttempts);
     slippage->setValue(c.slippageBps);
     execution->setCurrentIndex(int(c.execution));
     rendering = wasRendering;
@@ -82,6 +84,8 @@ Config Window::configFromUi() const
     c.maxMarginUsage = c.marginLimitEnabled ? margin->value() / 100 : 0;
     c.cooldownMs = int(cooldown->value() * 1000);
     c.makerWaitMs = int(makerWait->value() * 1000);
+    c.balancedPassiveAttempts = balancedAttempts->value();
+    c.aggressivePassiveAttempts = aggressiveAttempts->value();
     c.slippageBps = slippage->value();
     c.execution = Execution(execution->currentIndex());
     c.selected = draftSelected;

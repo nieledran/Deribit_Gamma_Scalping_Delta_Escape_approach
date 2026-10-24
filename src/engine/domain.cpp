@@ -62,6 +62,9 @@ QString Config::validate() const
     if (cooldownMs < Limits::MinOperationIntervalMs || cooldownMs > Limits::MaxCooldownMs ||
         makerWaitMs < Limits::MinOperationIntervalMs || makerWaitMs > Limits::MaxMakerWaitMs)
         return "Invalid cooldown or maker attempt duration";
+    if (balancedPassiveAttempts < 1 || balancedPassiveAttempts > Limits::MaxPassiveAttempts ||
+        aggressivePassiveAttempts < 1 || aggressivePassiveAttempts > Limits::MaxPassiveAttempts)
+        return QString("Passive attempts must be between 1 and %1").arg(Limits::MaxPassiveAttempts);
     if (selected.isEmpty())
         return "Select at least one open option position";
     return {};
@@ -78,6 +81,8 @@ QJsonObject Config::json() const
             {"slippage_bps", slippageBps},
             {"cooldown_ms", cooldownMs},
             {"maker_wait_ms", makerWaitMs},
+            {"balanced_passive_attempts", balancedPassiveAttempts},
+            {"aggressive_passive_attempts", aggressivePassiveAttempts},
             {"execution", int(execution)}};
 }
 Config Config::fromJson(const QJsonObject& j)
@@ -94,6 +99,8 @@ Config Config::fromJson(const QJsonObject& j)
     c.slippageBps = j["slippage_bps"].toDouble(c.slippageBps);
     c.cooldownMs = j["cooldown_ms"].toInt(c.cooldownMs);
     c.makerWaitMs = j["maker_wait_ms"].toInt(c.makerWaitMs);
+    c.balancedPassiveAttempts = j["balanced_passive_attempts"].toInt(c.balancedPassiveAttempts);
+    c.aggressivePassiveAttempts = j["aggressive_passive_attempts"].toInt(c.aggressivePassiveAttempts);
     // Old profiles migrate once to ordinary limit execution.
     int m = j.contains("hedge_percent") ? j["execution"].toInt(int(c.execution))
                                         : int(Execution::Balanced);
