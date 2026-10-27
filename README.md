@@ -1,4 +1,6 @@
-Tested myself works as intended. Fully AI generated in 2 days, be careful.
+Tested myself; works as intended. Fully AI-generated in 2 days; be careful.
+
+UI looks similar to Grid-bot ones.
 
 # Deribit Gamma Scalper
 
