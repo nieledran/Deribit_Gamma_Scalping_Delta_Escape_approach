@@ -24,6 +24,7 @@ Window::Window(QString profile, Config c, bool isDemo, QUrl endpoint)
                 &AnalyticsWorker::connectHistory);
         connect(trading, &TradingWorker::historyStop, analytics,
                 &AnalyticsWorker::disconnectHistory);
+        connect(analytics, &AnalyticsWorker::reportIssue, trading, &TradingWorker::reportIssue);
         connect(trading, &TradingWorker::deleted, analytics, &AnalyticsWorker::deleteData);
         connect(trading, &TradingWorker::deleted, this,
                 [this]

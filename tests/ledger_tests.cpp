@@ -48,6 +48,22 @@ class LedgerTests : public QObject
         QVERIFY(std::abs(b.quantity - .04) < 1e-12);
         QCOMPARE(b.average, 101000.0);
     }
+    void incompleteOptionEpisodeIsRecheckedAfterBackfill()
+    {
+        QTemporaryDir dir;
+        const auto corePath = dir.filePath("core.db");
+        Store core(corePath);
+        Ledger ledger(corePath, dir.filePath("analytics.db"));
+        auto s = snap(1000000000);
+        const auto& option = s.positions.first();
+        ledger.ensureLegs(s);
+        ledger.logEntry("BTC", optionTrade(option, 1, s.timestamp - 1000, .05, .05, .05));
+        ledger.finishImport(s.constructionId, option);
+        QVERIFY(!ledger.value(s).complete);
+        ledger.logEntry("BTC", optionTrade(option, 2, s.timestamp - 500, .05, .1, .05));
+        ledger.finishImport(s.constructionId, option);
+        QVERIFY(ledger.value(s).complete);
+    }
     void durableIntentAndOwnership()
     {
         try

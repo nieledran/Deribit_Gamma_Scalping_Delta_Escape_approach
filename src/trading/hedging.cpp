@@ -4,6 +4,14 @@ namespace scalper
 {
 void TradingWorker::pump()
 {
+    flushJournal();
+    flushPnlStart();
+    if (skippedRequests && utcNow() - summaryAt >= Time::MinuteMs)
+    {
+        log(QString("Skipped %1 outdated queued requests before sending").arg(skippedRequests));
+        skippedRequests = 0;
+        summaryAt = utcNow();
+    }
     if (!client || !client->authenticated() || syncing || busy || resettingProfile)
         return;
     if (recovering)
@@ -61,9 +69,10 @@ void TradingWorker::pump()
         engine.flattening = engine.running = true;
         engine.active = false;
     }
-    const QString reason = engine.flattening
-        ? (engine.quote.fresh(utcNow()) ? QString() : "Fresh quote required to close hedge")
-        : engine.safety(utcNow());
+    const QString reason =
+        engine.flattening
+            ? (engine.quote.fresh(utcNow()) ? QString() : "Fresh quote required to close hedge")
+            : engine.safety(utcNow());
     if (!reason.isEmpty())
     {
         if (reason == engine.dataProblem(utcNow()) || engine.flattening)
@@ -95,7 +104,6 @@ void TradingWorker::pump()
             hedgeAlert.clear();
         }
         save();
-        log(status, {{"inventory", engine.inventory}, {"hedge_error", engine.quotes.error}});
     }
     const bool passive = engine.state == StrategyState::InitialHedge ||
                          engine.state == StrategyState::Corrective ||
@@ -106,8 +114,10 @@ void TradingWorker::pump()
             passiveSince = utcNow();
         if (utcNow() - passiveSince >= Time::PassiveHedgeAlertMs)
         {
-            hedgeAlert = QString("Passive hedge unfilled for 30 s; delta error %1 %2. Review exposure.")
-                             .arg(engine.quotes.error, 0, 'g', 8).arg(engine.config.base());
+            hedgeAlert =
+                QString("Passive hedge unfilled for 30 s; delta error %1 %2. Review exposure.")
+                    .arg(engine.quotes.error, 0, 'g', 8)
+                    .arg(engine.config.base());
             if (!passiveAlerted)
                 log(hedgeAlert);
             passiveAlerted = true;
@@ -130,8 +140,8 @@ void TradingWorker::pump()
             continue;
         const auto& desired = o.buy ? engine.quotes.buy : engine.quotes.sell;
         bool& seen = o.buy ? seenBuy : seenSell;
-        const bool invalid = !engine.running || !desired.enabled || o.role != desired.role || seen ||
-                             !o.postOnly || o.ioc ||
+        const bool invalid = !engine.running || !desired.enabled || o.role != desired.role ||
+                             seen || !o.postOnly || o.ioc ||
                              (o.buy ? o.price >= engine.quote.ask : o.price <= engine.quote.bid);
         seen = true;
         if (invalid)
@@ -159,10 +169,12 @@ void TradingWorker::pump()
             const bool less = desired.amount < remaining - engine.spec.step * .1;
             if (less != reductions)
                 continue;
-            if (std::abs(desired.price - o.price) < engine.spec.tickAt(o.price) * Limits::QuoteDeadbandTicks)
+            if (std::abs(desired.price - o.price) <
+                engine.spec.tickAt(o.price) * Limits::QuoteDeadbandTicks)
                 desired.price = o.price;
             if (std::abs(desired.price - o.price) > engine.spec.tickAt(o.price) * .1 ||
-                std::abs(desired.amount - remaining) > engine.spec.step * .1 || reducing != o.reduceOnly)
+                std::abs(desired.amount - remaining) > engine.spec.step * .1 ||
+                reducing != o.reduceOnly)
             {
                 editOrder(o, desired);
                 return;

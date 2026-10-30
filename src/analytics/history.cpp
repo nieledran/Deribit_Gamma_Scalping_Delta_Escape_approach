@@ -12,6 +12,9 @@ void AnalyticsWorker::connectHistory(QString id, QString secret, bool production
             ++epoch;
             ready = false;
             busy = false;
+            verifying = historyBlocked = false;
+            historyRetryAt = 0;
+            historyRetryMs = Time::SecondMs;
             account = identity;
             imports.clear();
             scheduled.clear();
@@ -25,39 +28,57 @@ void AnalyticsWorker::disconnectHistory()
     ++epoch;
     ready = false;
     busy = false;
+    verifying = false;
     imports.clear();
     if (history)
         history->stop();
 }
 void AnalyticsWorker::authenticateHistory()
 {
+    if (verifying || historyBlocked || !history->authenticated())
+        return;
+    verifying = true;
     const int generation = epoch;
     history->call("private/get_account_summary", {{"currency", "USDC"}, {"extended", true}},
                   [this, generation](const RpcResult& result)
-                  { guard([&] { verifyHistoryAccount(generation, result); }); });
+                  { guard([&] { verifyHistoryAccount(generation, result); }, true); });
 }
 void AnalyticsWorker::verifyHistoryAccount(int generation, const RpcResult& result)
 {
     if (generation != epoch)
         return;
+    verifying = false;
     if (!result.ok)
     {
-        historyStatus = "History account verification failed: " + result.error;
+        retryHistory("History account verification failed: " + result.error);
         return;
     }
     const auto s = snapshot();
     const auto value = result.value.toObject()["id"];
     const QString id = value.isString() ? value.toString() : QString::number(value.toInteger());
+    if (id.isEmpty() || id == "0")
+        throw std::runtime_error("History account identity is unavailable");
     const QString identity =
         id + "/" + (s.config.production ? "production/" : "testnet/") + s.config.instrument;
     if (identity != account)
     {
+        historyBlocked = true;
         history->stop();
         throw std::runtime_error("History connection account does not match the trading profile");
     }
     ready = true;
+    historyRetryAt = 0;
+    historyRetryMs = Time::SecondMs;
     historyStatus = "History connected";
     scheduleImports(s);
+}
+void AnalyticsWorker::retryHistory(const QString& reason)
+{
+    emit reportIssue(reason);
+    busy = verifying = false;
+    historyStatus = reason + "; retrying automatically";
+    historyRetryAt = utcNow() + historyRetryMs;
+    historyRetryMs = std::min(Exchange::MaxRetryMs, historyRetryMs * 2);
 }
 void AnalyticsWorker::scheduleImports(const TradingSnapshot& s)
 {
@@ -113,7 +134,8 @@ void AnalyticsWorker::queueDeliveryImport(const TradingSnapshot& s, const Option
 }
 void AnalyticsWorker::queueFundingImport(const TradingSnapshot& s)
 {
-    if (s.timestamp - lastFundingRefresh < History::RefreshIntervalMs)
+    const QString key = s.constructionId + "/funding";
+    if (scheduled.contains(key) || s.timestamp - lastFundingRefresh < History::RefreshIntervalMs)
         return;
     lastFundingRefresh = s.timestamp;
     Import job;
@@ -134,11 +156,19 @@ void AnalyticsWorker::queueFundingImport(const TradingSnapshot& s)
     if (job.start <= 0)
         return;
     job.start = std::max<qint64>(1, job.start - History::OverlapMs);
+    scheduled.insert(key);
     imports.enqueue(job);
 }
 void AnalyticsWorker::nextImport()
 {
-    if (!ready || busy || imports.isEmpty() || !ledger)
+    if (historyBlocked || utcNow() < historyRetryAt || !history->authenticated())
+        return;
+    if (!ready)
+    {
+        authenticateHistory();
+        return;
+    }
+    if (busy || imports.isEmpty() || !ledger)
         return;
     const Import job = imports.head();
     QJsonObject params{{"currency", job.currency},
@@ -152,17 +182,15 @@ void AnalyticsWorker::nextImport()
     const int generation = epoch;
     history->call("private/get_transaction_log", params,
                   [this, generation, job](const RpcResult& result)
-                  { guard([&] { receiveImport(generation, job, result); }); });
+                  { guard([&] { receiveImport(generation, job, result); }, true); });
 }
 void AnalyticsWorker::receiveImport(int generation, const Import& job, const RpcResult& response)
 {
     if (generation != epoch)
         return;
-    busy = false;
     if (!response.ok)
     {
-        historyStatus = "History import paused: " + response.error;
-        ready = false;
+        retryHistory("History import delayed: " + response.error);
         return;
     }
     const auto result = response.value.toObject();
@@ -182,9 +210,12 @@ void AnalyticsWorker::receiveImport(int generation, const Import& job, const Rpc
     }
     else
     {
-        imports.dequeue();
         finishImport(job);
+        imports.dequeue();
     }
+    historyRetryAt = 0;
+    historyRetryMs = Time::SecondMs;
+    busy = false;
     historyStatus = QString("History synchronized: %1; %2 request(s) pending")
                         .arg(job.name)
                         .arg(imports.size());
@@ -197,16 +228,17 @@ void AnalyticsWorker::finishImport(const Import& job)
     {
         ledger->finishImport(job.construction, job.option);
         const QString key = job.construction + "/" + job.name;
-        scheduled.remove(key);
         ledger->metadata("option_cursor/" + key, {{"at", job.end}});
+        scheduled.remove(key);
         return;
     }
     case ImportKind::Perpetual:
         ledger->metadata("perp_log_cursor", {{"at", job.end}});
+        scheduled.remove(job.construction + "/funding");
         return;
     case ImportKind::Delivery:
-        scheduled.remove(job.deliveryKey + "/delivery");
         ledger->metadata("delivery_cursor/" + job.deliveryKey, {{"at", job.end}});
+        scheduled.remove(job.deliveryKey + "/delivery");
         return;
     }
 }

@@ -235,13 +235,13 @@ static double signedAmount(const QJsonObject& j)
 void Ledger::finishImport(const QString& construction, const Option& o)
 {
     QSqlQuery q(db);
-    q.prepare(
-        "SELECT selected_at,quantity,start_id FROM legs WHERE construction=? AND instrument=?");
+    q.prepare("SELECT selected_at,quantity,start_id,complete FROM legs WHERE construction=? AND "
+              "instrument=?");
     q.addBindValue(construction);
     q.addBindValue(o.spec.name);
     if (!q.exec() || !q.next())
         return;
-    if (!q.value(2).toString().isEmpty())
+    if (!q.value(2).toString().isEmpty() && q.value(3).toBool())
         return; // Freeze the chosen position episode, including after its expiry.
     qint64 selected = q.value(0).toLongLong();
     double wanted = q.value(1).toDouble();
@@ -639,7 +639,6 @@ void Ledger::sample(const TradingSnapshot& s, const Valuation& v, const Analytic
 {
     if (s.timestamp - lastSample < 1000)
         return;
-    lastSample = s.timestamp;
     QJsonObject data = v.pnl.json();
     if (report && report->ready)
     {
@@ -649,6 +648,7 @@ void Ledger::sample(const TradingSnapshot& s, const Valuation& v, const Analytic
     sqlExec(db, "INSERT OR REPLACE INTO samples VALUES(?,?,?,?,?)",
             {s.timestamp, s.constructionId, compact(valuationSnapshot(s)), compact(data),
              int(v.complete)});
+    lastSample = s.timestamp;
 }
 AnalyticsSnapshot Ledger::report(const TradingSnapshot& s)
 {

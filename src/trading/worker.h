@@ -24,6 +24,7 @@ class TradingWorker : public QObject
     void stopTrading();
     void closeHedge();
     void deleteData();
+    void reportIssue(QString message);
     void shutdown();
   signals:
     void initialized();
@@ -47,7 +48,17 @@ class TradingWorker : public QObject
     QVector<Order> orders;
     QHash<QString, Option> positions;
     QHash<QString, Instrument> instruments;
-    QStringList messages;
+    struct JournalMessage
+    {
+        QString text;
+        bool important = false;
+    };
+    QVector<JournalMessage> messages;
+    QHash<QString, qint64> loggedAt;
+    QVector<QPair<QString, QJsonObject>> pendingEvents;
+    qint64 journalRetryAt = 0, pnlRetryAt = 0, summaryAt = 0;
+    quint64 skippedRequests = 0;
+    QHash<QString, QJsonObject> pendingPnlStarts;
     quint64 revision = 0, positionRevision = 0;
     int epoch = 0, attempts = 0;
     bool synced = false, syncing = false, busy = false, polling = false, storageFailed = false,
@@ -66,6 +77,7 @@ class TradingWorker : public QObject
     RunRequest requested = RunRequest::None;
     qint64 retryAt = 0;
     int recoveryChecks = 0;
+    int recoveryRetryMs = Time::FillRecoveryDelayMs;
     qint64 recoveryReadyAt = 0;
     double externalPosition = 0;
     qint64 requestId = 0, lastFill = 0, positionAt = 0;
@@ -80,7 +92,12 @@ class TradingWorker : public QObject
     qint64 fundingAt = 0, fundingBaselineSession = 0;
     bool fundingValid = false;
     bool guard(const std::function<void()>& operation);
-    void log(const QString& message, const QJsonObject& details = {});
+    void log(const QString& message, const QJsonObject& details = {}, bool important = false,
+             const QString& category = {});
+    void journalMessage(const QString& message, bool important);
+    void recordEvent(const QString& kind, const QJsonObject& details = {});
+    void flushJournal();
+    void flushPnlStart();
     void fail(const QString& reason);
     void save();
     void publish();
@@ -91,6 +108,7 @@ class TradingWorker : public QObject
     void subscribe(std::function<void()> done);
     void reconcile();
     void requestRecovery(const QString& reason);
+    void deferRecovery(const QString& reason);
     void recoverPosition();
     void reconcileOrder(int index, std::function<void()> done);
     void resolveAbsentOrder(int index, std::function<void()> done);

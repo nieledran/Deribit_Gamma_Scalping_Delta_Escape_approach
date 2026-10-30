@@ -94,6 +94,8 @@ void TradingWorker::initializeExchange()
                         }
                     }
                     client->setTradingLimits(j["limits"].toObject());
+                    emit historyConnect(clientId, clientSecret, engine.config.production, account,
+                                        endpoint);
                     engine.margin = Margin::parse(j, utcNow());
                     auto fee = j["fees"]
                                    .toObject()[engine.config.base().toLower() + "_usdc"]

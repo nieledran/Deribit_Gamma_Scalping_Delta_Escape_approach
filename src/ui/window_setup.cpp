@@ -88,7 +88,6 @@ void Window::setupUi()
                     return;
                 }
                 auto clientId = id->text().trimmed(), clientSecret = secret->text();
-                secret->clear();
                 QMetaObject::invokeMethod(trading, [w = trading, clientId, clientSecret]
                                           { w->connectExchange(clientId, clientSecret); });
             });

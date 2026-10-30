@@ -18,6 +18,10 @@ Windows x64 app that hedges existing BTC or ETH options with USDC perpetuals. It
 
 Settings and history are in `gamma-profiles/` beside the executable. Keep this folder when updating; close the app before replacing files or copying its databases. API credentials stay in memory.
 
+The masked secret remains in the connection box while the app is open. Connection loss, delayed fill details, and P&L history requests recover automatically; Stop & Cancel cancels automatic trading resumption. Incomplete P&L and report/journal write errors do not stop hedging. Uncertain execution pauses new orders until orders, fills and the account position agree. Durable order/fill storage and ownership checks remain required for trading.
+
+The journal records fills, important changes, warnings and errors. Routine order edits and updates are kept in the order records instead of duplicated in the event log; outdated queued requests are summarized at most once per minute. The visible journal reserves space for recent warnings/errors, and saved events are not automatically deleted. Credentials are never saved in the profile or journal.
+
 ## Build from source (optional)
 
 If no Windows release ZIP is available:

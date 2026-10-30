@@ -18,7 +18,12 @@
 #include <utility>
 using namespace scalper;
 // Legacy harness argument retained locally while exercising migrated profile scenarios.
-enum class Execution { PostOnly, Balanced, Aggressive };
+enum class Execution
+{
+    PostOnly,
+    Balanced,
+    Aggressive
+};
 class FakeDeribit : public QObject
 {
     Q_OBJECT
@@ -49,6 +54,10 @@ class FakeDeribit : public QObject
     int resetOrderSnapshots = 0;
     QStringList cancelledLabels;
     bool paginateHistory = false;
+    int rejectHistoryVerification = 0, rejectHistoryImports = 0, invalidHistoryPages = 0;
+    bool hideFillDetails = false;
+    std::atomic<int> fillHistoryRequests{0};
+    int filledEditError = 0;
     bool optionNotifications = true, overrideOptionPositions = false, staleOptionSnapshots = false;
     bool perpetualNotifications = true, stalePerpetualSnapshots = false;
     bool invalidBid = false, invalidGreeks = false;
@@ -66,7 +75,8 @@ class FakeDeribit : public QObject
     void initialize()
     {
         server = new QWebSocketServer("Fake Deribit", QWebSocketServer::NonSecureMode, this);
-        server->listen(QHostAddress::LocalHost, 0);
+        if (!server->listen(QHostAddress::LocalHost, 0))
+            qFatal("Fake exchange listen failed: %s", qPrintable(server->errorString()));
         port = server->serverPort();
         connect(server, &QWebSocketServer::newConnection, this,
                 [this]
@@ -175,7 +185,8 @@ class FakeDeribit : public QObject
                           {"fee_currency", "USDC"},
                           {"timestamp", utcNow()}};
         fills[order["order_id"].toString()].append(trade);
-        const QJsonObject payload{{"orders", QJsonArray{order}}, {"trades", QJsonArray{trade}}};
+        const QJsonObject payload{{"orders", QJsonArray{order}},
+                                  {"trades", hideFillDetails ? QJsonArray{} : QJsonArray{trade}}};
         QTimer::singleShot(delayMs, this, [this, payload]
                            { notification("user.changes.BTC_USDC-PERPETUAL.100ms", payload); });
     }
@@ -210,13 +221,22 @@ class FakeDeribit : public QObject
         }
         if (method == "private/get_account_summary")
         {
+            if (peers.indexOf(socket) > 0 && rejectHistoryVerification > 0)
+            {
+                --rejectHistoryVerification;
+                rpcError(socket, id, 10028, "temporary history account failure");
+                return;
+            }
             send(socket, id,
-                 QJsonObject{{"id", 123},
-                             {"margin_balance", 10000},
-                             {"maintenance_margin", 100},
-                             {"available_funds", 9900},
-                             {"fees", QJsonObject{{"btc_usdc", QJsonObject{
-                                 {"perpetual", QJsonObject{{"default", accountFees}}}}}}}});
+                 QJsonObject{
+                     {"id", 123},
+                     {"margin_balance", 10000},
+                     {"maintenance_margin", 100},
+                     {"available_funds", 9900},
+                     {"fees",
+                      QJsonObject{
+                          {"btc_usdc",
+                           QJsonObject{{"perpetual", QJsonObject{{"default", accountFees}}}}}}}});
             return;
         }
         if (method == "public/get_instrument")
@@ -328,7 +348,9 @@ class FakeDeribit : public QObject
         }
         if (method == "private/get_user_trades_by_order")
         {
-            send(socket, id, fills.value(p["order_id"].toString()));
+            ++fillHistoryRequests;
+            send(socket, id,
+                 hideFillDetails ? QJsonArray{} : fills.value(p["order_id"].toString()));
             return;
         }
         if (method == "private/get_user_trades_by_instrument_and_time")
@@ -378,13 +400,24 @@ class FakeDeribit : public QObject
         {
             ++marginRequests;
             lastMarginAmount = p["amount"].toDouble();
-            QTimer::singleShot(marginDelayMs, this, [this, socket, id] {
-                send(socket, id, QJsonObject{{"buy", 10}, {"sell", 10}});
-            });
+            QTimer::singleShot(marginDelayMs, this, [this, socket, id]
+                               { send(socket, id, QJsonObject{{"buy", 10}, {"sell", 10}}); });
             return;
         }
         if (method == "private/get_transaction_log")
         {
+            if (rejectHistoryImports > 0)
+            {
+                --rejectHistoryImports;
+                rpcError(socket, id, 10028, "temporary transaction history failure");
+                return;
+            }
+            if (invalidHistoryPages > 0)
+            {
+                --invalidHistoryPages;
+                send(socket, id, QJsonObject{});
+                return;
+            }
             if (p["query"] == o.spec.name)
             {
                 ++historyPages;
@@ -458,8 +491,10 @@ class FakeDeribit : public QObject
                               {"time_in_force", p["time_in_force"]},
                               {"last_update_timestamp", utcNow()}};
             QJsonArray trades;
-            if ((!holdMaker && (method == "private/buy" ? p["price"].toDouble() >= 99999 + quoteShift - spreadExtra
-                                                                 : p["price"].toDouble() <= 100001 + quoteShift + spreadExtra)) ||
+            if ((!holdMaker &&
+                 (method == "private/buy"
+                      ? p["price"].toDouble() >= 99999 + quoteShift - spreadExtra
+                      : p["price"].toDouble() <= 100001 + quoteShift + spreadExtra)) ||
                 p["time_in_force"] == "immediate_or_cancel")
             {
                 const double executed = partialIoc && p["time_in_force"] == "immediate_or_cancel" &&
@@ -499,6 +534,15 @@ class FakeDeribit : public QObject
                 {
                     verifyIntent(it.key());
                     auto order = it.value();
+                    if (method == "private/edit" && filledEditError)
+                    {
+                        const int code = std::exchange(filledEditError, 0);
+                        fillOrder(it.key(),
+                                  order["amount"].toDouble() - order["filled_amount"].toDouble(),
+                                  200);
+                        rpcError(socket, id, code, "other_reject order_not_found");
+                        return;
+                    }
                     if (method == "private/cancel" && fillOnCancel &&
                         order["order_state"] == "open")
                     {
@@ -914,7 +958,7 @@ class RuntimeTests : public QObject
             QVERIFY(snapshot().problem.isEmpty());
         }
         QVERIFY(snapshot().exchangeClockOffsetMs.has_value());
-        QVERIFY(window.findChild<QLineEdit*>("clientSecret")->text().isEmpty());
+        QCOMPARE(window.findChild<QLineEdit*>("clientSecret")->text(), QString("fake"));
         QVERIFY(!window.findChild<QDoubleSpinBox*>("cooldown"));
         QVERIFY(!window.findChild<QDoubleSpinBox*>("makerWait"));
         QVERIFY(!window.findChild<QComboBox*>("executionMode"));
@@ -1040,7 +1084,8 @@ class RuntimeTests : public QObject
             [&]
             {
                 const auto first = h.server->submitted.first();
-                const double quantity = std::abs(target - (std::abs(inventory) < Epsilon ? 0 : inventory));
+                const double quantity =
+                    std::abs(target - (std::abs(inventory) < Epsilon ? 0 : inventory));
                 QVERIFY(std::abs(first["amount"].toDouble() - quantity) < Epsilon);
                 QVERIFY(!first["reduce_only"].toBool());
                 QVERIFY(first["post_only"].toBool());
@@ -1093,6 +1138,184 @@ class RuntimeTests : public QObject
         QCOMPARE(report().startedAt, started);
         window.findChild<QPushButton*>("stop")->click();
     }
+    void historyFailuresRetryWithoutStoppingTrading_data()
+    {
+        QTest::addColumn<QString>("fault");
+        QTest::newRow("account-verification") << QString("verification");
+        QTest::newRow("transaction-import") << QString("import");
+        QTest::newRow("invalid-page") << QString("page");
+    }
+    void historyFailuresRetryWithoutStoppingTrading()
+    {
+        QFETCH(QString, fault);
+        QTemporaryDir d;
+        const auto path = d.filePath("history-retry.db");
+        RuntimeHarness h(path, Execution::PostOnly, false, false, false);
+        QMetaObject::invokeMethod(
+            h.server,
+            [&]
+            {
+                h.server->rejectHistoryVerification = fault == "verification" ? 3 : 0;
+                h.server->rejectHistoryImports = fault == "import" ? 3 : 0;
+                h.server->invalidHistoryPages = fault == "page" ? 3 : 0;
+                h.server->paginateHistory = true;
+            },
+            Qt::BlockingQueuedConnection);
+        Config c;
+        c.hedgePercent = 20;
+        c.selected = {fixtures::option(utcNow()).spec.name};
+        Window window(path, c, false, h.endpoint);
+        auto shared = window.sharedState();
+        window.show();
+        auto trading = [&]
+        {
+            std::lock_guard<std::mutex> lock(shared->mutex);
+            return shared->trading;
+        };
+        auto report = [&]
+        {
+            std::lock_guard<std::mutex> lock(shared->mutex);
+            return shared->analytics;
+        };
+        QTRY_VERIFY(!trading().profileId.isEmpty());
+        window.findChild<QLineEdit*>("clientId")->setText("fake");
+        window.findChild<QLineEdit*>("clientSecret")->setText("fake");
+        window.findChild<QPushButton*>("connect")->click();
+        QTRY_VERIFY2_WITH_TIMEOUT(trading().synced,
+                                 qPrintable(trading().problem + " " + trading().messages.join(' ')), 15000);
+        QTRY_VERIFY(window.findChild<QPushButton*>("start")->isEnabled());
+        window.findChild<QPushButton*>("start")->click();
+        QTRY_VERIFY_WITH_TIMEOUT(trading().running && trading().anchored, 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(report().ready && report().complete, 25000);
+        QVERIFY(trading().running);
+        QVERIFY(trading().messages.join(' ').contains("P&L warning:"));
+        QVERIFY(!trading().messages.join(' ').contains("ERROR:"));
+        QTRY_VERIFY(!report().message.startsWith("Analytics error:"));
+
+        // A report database write failure stays separate from execution and clears on recovery.
+        Ledger ledger(path, path + ".analytics.db");
+        sqlExec(ledger.database(),
+                "CREATE TRIGGER reject_sample BEFORE INSERT ON samples "
+                "BEGIN SELECT RAISE(ABORT,'temporary report write failure'); END");
+        QTRY_VERIFY_WITH_TIMEOUT(report().message.contains("temporary report write failure"), 5000);
+        QVERIFY(trading().running);
+        sqlExec(ledger.database(), "DROP TRIGGER reject_sample");
+        QTRY_VERIFY_WITH_TIMEOUT(!report().message.startsWith("Analytics error:"), 5000);
+        QVERIFY(trading().running);
+        window.findChild<QPushButton*>("stop")->click();
+        QTRY_VERIFY(!trading().running && !trading().busy);
+    }
+    void journalAndPnlStartWritesDoNotStopTrading()
+    {
+        QTemporaryDir d;
+        const auto path = d.filePath("diagnostic-write.db");
+        RuntimeHarness h(path);
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
+        Store core(path);
+        sqlExec(core.database(), "CREATE TRIGGER reject_journal BEFORE INSERT ON events "
+                                 "BEGIN SELECT RAISE(ABORT,'temporary journal failure'); END");
+        sqlExec(core.database(), "CREATE TRIGGER reject_pnl BEFORE INSERT ON meta "
+                                 "WHEN NEW.key LIKE 'pnl_start/%' BEGIN SELECT "
+                                 "RAISE(ABORT,'temporary baseline failure'); END");
+        h.start();
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().running && h.snapshot().anchored, 10000);
+        QVERIFY(h.snapshot().messages.join(' ').contains("Journal write delayed"));
+        QVERIFY(h.snapshot().messages.join(' ').contains("P&L start recording delayed"));
+        const auto firstStart = utcNow();
+        const auto key = "pnl_start/" + h.snapshot().constructionId;
+        QVERIFY(core.metadata(key).isEmpty());
+        sqlExec(core.database(), "DROP TRIGGER reject_journal");
+        sqlExec(core.database(), "DROP TRIGGER reject_pnl");
+        QTRY_VERIFY_WITH_TIMEOUT(!core.metadata(key).isEmpty(), 5000);
+        QVERIFY(core.metadata(key)["at"].toInteger() <= firstStart);
+        QSqlQuery events(core.database());
+        QTRY_VERIFY_WITH_TIMEOUT(events.exec("SELECT 1 FROM events WHERE kind='Trading started'") &&
+                                     events.next(),
+                                 5000);
+        events.finish();
+        QVERIFY(h.snapshot().running);
+        QVERIFY(h.server->durable.load());
+
+        // Routine diagnostics cannot push the warning out of the in-memory journal.
+        QMetaObject::invokeMethod(
+            h.worker,
+            [&]
+            {
+                auto* client = h.worker->findChild<Client*>();
+                for (int i = 0; i < 250; ++i)
+                    emit client->notice(QString("diagnostic %1").arg(i));
+            },
+            Qt::BlockingQueuedConnection);
+        QTRY_VERIFY(h.snapshot().messages.join(' ').contains("diagnostic 249"));
+        QVERIFY(h.snapshot().messages.join(' ').contains("Journal write delayed"));
+        QVERIFY(h.snapshot().messages.size() <= Limits::JournalMessages);
+        QSqlQuery noise(core.database());
+        QVERIFY(
+            noise.exec("SELECT COUNT(*) FROM events WHERE kind IN ('order_intent','order_update') "
+                       "OR kind LIKE '%failed: code 0%'") &&
+            noise.next());
+        QCOMPARE(noise.value(0).toInt(), 0);
+        QVERIFY(core.coveredQuantity(h.snapshot().orders.first().id) > 0);
+    }
+    void delayedFillDetailsResumeWithoutReconnect_data()
+    {
+        QTest::addColumn<bool>("manualStop");
+        QTest::newRow("resume") << false;
+        QTest::newRow("stop-cancels-resume") << true;
+    }
+    void delayedFillDetailsResumeWithoutReconnect()
+    {
+        QFETCH(bool, manualStop);
+        QTemporaryDir d;
+        RuntimeHarness h(d.filePath("delayed-fills.db"));
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
+        h.start();
+        QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 2 && !h.snapshot().busy, 10000);
+        QMetaObject::invokeMethod(
+            h.server,
+            [&]
+            {
+                h.server->hideFillDetails = true;
+                h.server->holdMaker = true; // Keep later strategy corrections from filling in this test.
+                for (auto it = h.server->byLabel.begin(); it != h.server->byLabel.end(); ++it)
+                    if (it.value()["order_state"] == "open")
+                    {
+                        h.server->fillOrder(it.key(), it.value()["amount"].toDouble());
+                        break;
+                    }
+            },
+            Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(h.server->fillHistoryRequests.load() >= 4, 10000);
+        QVERIFY(!h.snapshot().running);
+        QVERIFY(!h.snapshot().messages.join(' ').contains("ERROR:"));
+        if (manualStop)
+            QMetaObject::invokeMethod(h.worker, &TradingWorker::stopTrading);
+        QMetaObject::invokeMethod(
+            h.server, [&] { h.server->hideFillDetails = false; }, Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced && !h.snapshot().busy, 15000);
+        QCOMPARE(h.snapshot().running, !manualStop);
+        QCOMPARE(h.filledCount(), 2);
+        QVERIFY(h.server->durable.load());
+    }
+    void filledOrderEditOtherRejectRecovers()
+    {
+        QTemporaryDir d;
+        RuntimeHarness h(d.filePath("edit-race.db"));
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
+        h.start();
+        QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 2 && !h.snapshot().busy, 10000);
+        QMetaObject::invokeMethod(
+            h.server,
+            [&]
+            {
+                h.server->filledEditError = 11030;
+                h.server->quoteShift += 20;
+            },
+            Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            h.filledCount() == 2 && h.snapshot().running && h.snapshot().synced, 15000);
+        QVERIFY(!h.snapshot().messages.join(' ').contains("ERROR:"));
+    }
     void demoHasEnglishControls()
     {
         Window window("", Config{}, true);
@@ -1117,7 +1340,9 @@ class RuntimeTests : public QObject
         QVERIFY(window.findChild<QLabel*>("buyHedgeLevel")->y() <
                 window.findChild<QLabel*>("sellHedgeLevel")->y());
         for (auto name : {"deltaPanel", "hedgePanel", "executionPanel"})
-            QCOMPARE(qobject_cast<QGridLayout*>(window.findChild<QWidget*>(name)->layout())->rowCount(), 4);
+            QCOMPARE(
+                qobject_cast<QGridLayout*>(window.findChild<QWidget*>(name)->layout())->rowCount(),
+                4);
         auto* bid = window.findChild<QWidget*>("bidQuote");
         auto* ask = window.findChild<QWidget*>("askQuote");
         auto* middle = window.findChild<QLabel*>("riskSummary");
@@ -1154,17 +1379,22 @@ class RuntimeTests : public QObject
         auto c = h.snapshot().config;
         c.fallbackMakerFee = -.0001;
         c.fallbackTakerFee = .0007;
-        QMetaObject::invokeMethod(h.worker, [&, c] { h.worker->applyConfig(c); },
-                                  Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.worker, [&, c] { h.worker->applyConfig(c); }, Qt::BlockingQueuedConnection);
         QTRY_COMPARE(h.snapshot().makerFee, c.fallbackMakerFee);
         QCOMPARE(h.snapshot().takerFee, c.fallbackTakerFee);
-        QMetaObject::invokeMethod(h.server,
-            [&] { h.server->accountFees = relative
-                ? QJsonObject{{"type", "relative"}, {"maker", .5}, {"taker", .75}}
-                : QJsonObject{{"type", "fixed"}, {"maker", -.00005}, {"taker", .0002}}; },
+        QMetaObject::invokeMethod(
+            h.server,
+            [&]
+            {
+                h.server->accountFees =
+                    relative ? QJsonObject{{"type", "relative"}, {"maker", .5}, {"taker", .75}}
+                             : QJsonObject{{"type", "fixed"}, {"maker", -.00005}, {"taker", .0002}};
+            },
             Qt::BlockingQueuedConnection);
-        QMetaObject::invokeMethod(h.worker, [&] { h.worker->connectExchange("fake", "fake"); },
-                                  Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.worker, [&] { h.worker->connectExchange("fake", "fake"); },
+            Qt::BlockingQueuedConnection);
         const double expectedMaker = relative ? Exchange::DefaultMakerFee * .5 : -.00005;
         const double expectedTaker = relative ? Exchange::DefaultTakerFee * .75 : .0002;
         QTRY_COMPARE(h.snapshot().makerFee, expectedMaker);
@@ -1172,15 +1402,16 @@ class RuntimeTests : public QObject
         QCOMPARE(h.snapshot().takerFee, expectedTaker);
         c.fallbackMakerFee = .0002;
         c.fallbackTakerFee = .0009;
-        QMetaObject::invokeMethod(h.worker, [&, c] { h.worker->applyConfig(c); },
-                                  Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.worker, [&, c] { h.worker->applyConfig(c); }, Qt::BlockingQueuedConnection);
         QTRY_COMPARE(h.snapshot().config.fallbackTakerFee, .0009);
         QCOMPARE(h.snapshot().makerFee, expectedMaker);
         QCOMPARE(h.snapshot().takerFee, expectedTaker);
-        QMetaObject::invokeMethod(h.server, [&] { h.server->accountFees = {}; },
-                                  Qt::BlockingQueuedConnection);
-        QMetaObject::invokeMethod(h.worker, [&] { h.worker->connectExchange("fake", "fake"); },
-                                  Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.server, [&] { h.server->accountFees = {}; }, Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.worker, [&] { h.worker->connectExchange("fake", "fake"); },
+            Qt::BlockingQueuedConnection);
         QTRY_COMPARE(h.snapshot().makerFee, c.fallbackMakerFee);
         QTRY_VERIFY(h.snapshot().synced);
         QCOMPARE(h.snapshot().takerFee, c.fallbackTakerFee);
@@ -1531,14 +1762,14 @@ class RuntimeTests : public QObject
         window.show();
         QTest::qWait(100);
         const QStringList names = {
-            "riskSummary",     "bidQuote",        "askQuote",        "rebalanceBand",
-            "breakEvenMove",   "pnlCoverage",     "hedgeEstimate",   "netDeltaValue",
-            "hedgeValue",      "hedgeUsage",      "normalizedDelta", "referenceDelta",
-            "legsValue",       "tradingActivity", "latencyStatus",
-            "quoteAge",        "clockDifference", "dataQuality",     "connectionStatus",
-            "optionPositions", "connect",         "advanced",        "actions",
-            "pnlPanel",        "executionState",  "marketPanel",     "deltaPanel",
-            "hedgePanel",      "executionPanel",  "connectionPanel", "messagePanel"};
+            "riskSummary",     "bidQuote",        "askQuote",         "rebalanceBand",
+            "breakEvenMove",   "pnlCoverage",     "hedgeEstimate",    "netDeltaValue",
+            "hedgeValue",      "hedgeUsage",      "normalizedDelta",  "referenceDelta",
+            "legsValue",       "tradingActivity", "latencyStatus",    "quoteAge",
+            "clockDifference", "dataQuality",     "connectionStatus", "optionPositions",
+            "connect",         "advanced",        "actions",          "pnlPanel",
+            "executionState",  "marketPanel",     "deltaPanel",       "hedgePanel",
+            "executionPanel",  "connectionPanel", "messagePanel"};
         QVector<QRect> bounds;
         for (const auto& name : names)
         {
@@ -1705,7 +1936,6 @@ class RuntimeTests : public QObject
         QVERIFY(restored.anchored);
     }
 
-
     void restingPairHasNoTimedFallback()
     {
         QTemporaryDir d;
@@ -1713,24 +1943,35 @@ class RuntimeTests : public QObject
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
         h.start();
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().strategy == StrategyState::Quoting &&
-                                 h.snapshot().orders.size() == 3 && !h.snapshot().busy, 10000);
+                                     h.snapshot().orders.size() == 3 && !h.snapshot().busy,
+                                 10000);
         const auto initial = h.snapshot();
         QCOMPARE(initial.inventory, -.01);
         QVERIFY(initial.hedgeQuotes.buy.enabled && initial.hedgeQuotes.sell.enabled);
         const int mutations = h.server->mutations.load();
         QTest::qWait(5600);
         QCOMPARE(h.server->mutations.load(), mutations);
-        QMetaObject::invokeMethod(h.server, [&] {
-            for (auto p : h.server->submitted) {
-                QVERIFY(p["post_only"].toBool());
-                QCOMPARE(p["time_in_force"].toString(), QString("good_til_cancelled"));
-            }
-        }, Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.server,
+            [&]
+            {
+                for (auto p : h.server->submitted)
+                {
+                    QVERIFY(p["post_only"].toBool());
+                    QCOMPARE(p["time_in_force"].toString(), QString("good_til_cancelled"));
+                }
+            },
+            Qt::BlockingQueuedConnection);
         QMetaObject::invokeMethod(h.worker, &TradingWorker::stopTrading);
-        QTRY_VERIFY_WITH_TIMEOUT(!h.snapshot().running && !h.snapshot().busy &&
-            [&] { const auto snapshot = h.snapshot();
-                  return std::all_of(snapshot.orders.begin(), snapshot.orders.end(),
-                                     [](const Order& o) { return o.terminal; }); }(), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !h.snapshot().running && !h.snapshot().busy &&
+                [&]
+                {
+                    const auto snapshot = h.snapshot();
+                    return std::all_of(snapshot.orders.begin(), snapshot.orders.end(),
+                                       [](const Order& o) { return o.terminal; });
+                }(),
+            5000);
     }
 
     void restingDeadbandAndBothSideFills()
@@ -1742,22 +1983,32 @@ class RuntimeTests : public QObject
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().orders.size() == 3 && !h.snapshot().busy, 10000);
         const auto initial = h.snapshot();
         const int before = h.server->mutations.load();
-        QMetaObject::invokeMethod(h.server, [&] { h.server->quoteShift = 1; }, Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.server, [&] { h.server->quoteShift = 1; }, Qt::BlockingQueuedConnection);
         QTest::qWait(900);
         QCOMPARE(h.server->mutations.load(), before);
-        QMetaObject::invokeMethod(h.server, [&] { h.server->quoteShift = 5; }, Qt::BlockingQueuedConnection);
-        QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() >= before + 2 && !h.snapshot().busy, 5000);
+        QMetaObject::invokeMethod(
+            h.server, [&] { h.server->quoteShift = 5; }, Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() >= before + 2 && !h.snapshot().busy,
+                                 5000);
         double expected = initial.inventory;
-        QMetaObject::invokeMethod(h.server, [&] {
-            for (auto it = h.server->byLabel.begin(); it != h.server->byLabel.end(); ++it)
-                if (it.value()["order_state"] == "open") {
-                    const double quantity = it.value()["amount"].toDouble() - it.value()["filled_amount"].toDouble();
-                    expected += (it.value()["direction"] == "buy" ? 1 : -1) * quantity;
-                    h.server->fillOrder(it.key(), quantity);
-                }
-        }, Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.server,
+            [&]
+            {
+                for (auto it = h.server->byLabel.begin(); it != h.server->byLabel.end(); ++it)
+                    if (it.value()["order_state"] == "open")
+                    {
+                        const double quantity = it.value()["amount"].toDouble() -
+                                                it.value()["filled_amount"].toDouble();
+                        expected += (it.value()["direction"] == "buy" ? 1 : -1) * quantity;
+                        h.server->fillOrder(it.key(), quantity);
+                    }
+            },
+            Qt::BlockingQueuedConnection);
         QTRY_VERIFY_WITH_TIMEOUT(std::abs(h.snapshot().inventory - expected) < Epsilon &&
-                                 h.snapshot().orders.size() >= 5 && !h.snapshot().busy, 10000);
+                                     h.snapshot().orders.size() >= 5 && !h.snapshot().busy,
+                                 10000);
         const auto final = h.snapshot();
         QVERIFY(final.running && final.synced);
         int live = 0;
@@ -1778,20 +2029,27 @@ class RuntimeTests : public QObject
             db.setDatabaseName(path);
             QVERIFY(db.open());
             QSqlQuery query(db);
-            QVERIFY(query.exec("CREATE TRIGGER reject_second_quote BEFORE INSERT ON orders "
-                               "WHEN NEW.data LIKE '%\"role\":\"sell_level\"%' "
-                               "BEGIN SELECT RAISE(FAIL,'injected second quote save failure'); END"));
+            QVERIFY(
+                query.exec("CREATE TRIGGER reject_second_quote BEFORE INSERT ON orders "
+                           "WHEN NEW.data LIKE '%\"role\":\"sell_level\"%' "
+                           "BEGIN SELECT RAISE(FAIL,'injected second quote save failure'); END"));
             db.close();
         }
         QSqlDatabase::removeDatabase(connection);
         h.start();
-        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().messages.join(" ").contains("injected second quote"), 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().messages.join(" ").contains("injected second quote"),
+                                 10000);
         QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() >= 3 && !h.snapshot().busy, 5000);
-        QMetaObject::invokeMethod(h.server, [&] {
-            QCOMPARE(h.server->submitted.size(), 2); // Initial hedge and first resting side only.
-            for (const auto& order : h.server->byLabel)
-                QVERIFY(order["order_state"] != "open");
-        }, Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.server,
+            [&]
+            {
+                QCOMPARE(h.server->submitted.size(),
+                         2); // Initial hedge and first resting side only.
+                for (const auto& order : h.server->byLabel)
+                    QVERIFY(order["order_state"] != "open");
+            },
+            Qt::BlockingQueuedConnection);
         QVERIFY(!h.snapshot().running);
         QCOMPARE(h.snapshot().inventory, -.01);
     }
@@ -1800,15 +2058,21 @@ class RuntimeTests : public QObject
         QTemporaryDir d;
         RuntimeHarness h(d.filePath("stale-preflight.db"), Execution::PostOnly, true);
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
-        QMetaObject::invokeMethod(h.server, [&] { h.server->marginDelayMs = 700; }, Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.server, [&] { h.server->marginDelayMs = 700; }, Qt::BlockingQueuedConnection);
         h.start();
         QTRY_VERIFY_WITH_TIMEOUT(h.server->marginRequests.load() > 0, 5000);
-        QMetaObject::invokeMethod(h.server, [&] { h.server->delta = .6; }, Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.server, [&] { h.server->delta = .6; }, Qt::BlockingQueuedConnection);
         QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() == 1, 5000);
-        QMetaObject::invokeMethod(h.server, [&] {
-            QCOMPARE(h.server->submitted.size(), 1);
-            QCOMPARE(h.server->submitted.first()["amount"].toDouble(), .012);
-        }, Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.server,
+            [&]
+            {
+                QCOMPARE(h.server->submitted.size(), 1);
+                QCOMPARE(h.server->submitted.first()["amount"].toDouble(), .012);
+            },
+            Qt::BlockingQueuedConnection);
         QVERIFY(h.server->durable.load());
     }
     void passiveHedgeAlertsWithoutCrossing()
@@ -1830,14 +2094,21 @@ class RuntimeTests : public QObject
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
         h.start();
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().orders.size() == 3 && !h.snapshot().busy, 10000);
-        QMetaObject::invokeMethod(h.server, [&] { h.server->gamma = 0; }, Qt::BlockingQueuedConnection);
-        QTRY_VERIFY_WITH_TIMEOUT(!h.snapshot().running && !h.snapshot().busy &&
-            [&] { const auto snapshot = h.snapshot();
-                  return std::all_of(snapshot.orders.begin(), snapshot.orders.end(),
-                                     [](const Order& o) { return o.terminal; }); }(), 5000);
+        QMetaObject::invokeMethod(
+            h.server, [&] { h.server->gamma = 0; }, Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            !h.snapshot().running && !h.snapshot().busy &&
+                [&]
+                {
+                    const auto snapshot = h.snapshot();
+                    return std::all_of(snapshot.orders.begin(), snapshot.orders.end(),
+                                       [](const Order& o) { return o.terminal; });
+                }(),
+            5000);
         QVERIFY(h.snapshot().problem.contains("positive"));
         QMetaObject::invokeMethod(h.worker, &TradingWorker::closeHedge);
-        QTRY_VERIFY_WITH_TIMEOUT(std::abs(h.snapshot().inventory) < Epsilon && !h.snapshot().running, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            std::abs(h.snapshot().inventory) < Epsilon && !h.snapshot().running, 5000);
     }
     void lostCreateReplyIsRecoveredWithoutDuplicate()
     {
@@ -1895,8 +2166,7 @@ class RuntimeTests : public QObject
                 QCOMPARE(h.server->byLabel.size(), 3); // Replacement hedge plus two resting orders.
                 QVERIFY(h.server->cancelledLabels.contains(
                     h.server->submitted.first()["label"].toString()));
-                QVERIFY(h.server->submitted[1]["label"] !=
-                        h.server->submitted.first()["label"]);
+                QVERIFY(h.server->submitted[1]["label"] != h.server->submitted.first()["label"]);
             },
             Qt::BlockingQueuedConnection);
     }
@@ -1971,7 +2241,10 @@ class RuntimeTests : public QObject
             QMetaObject::invokeMethod(
                 h.server, [&] { h.server->holdMaker = true; }, Qt::BlockingQueuedConnection);
             QMetaObject::invokeMethod(h.worker, &TradingWorker::closeHedge);
-            QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 1 && h.snapshot().strategy == StrategyState::Closing && !h.snapshot().busy, 5000);
+            QTRY_VERIFY_WITH_TIMEOUT(h.liveCount() == 1 &&
+                                         h.snapshot().strategy == StrategyState::Closing &&
+                                         !h.snapshot().busy,
+                                     5000);
         }
         QMetaObject::invokeMethod(
             h.server,
@@ -2084,12 +2357,16 @@ class RuntimeTests : public QObject
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
         h.start();
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().strategy == StrategyState::Quoting, 10000);
-        QMetaObject::invokeMethod(h.server, [&] { h.server->spreadExtra = 2000; }, Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.server, [&] { h.server->spreadExtra = 2000; }, Qt::BlockingQueuedConnection);
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().hedgeQuotes.buy.reason.contains("tight") &&
-                                 h.snapshot().hedgeQuotes.sell.reason.contains("tight"), 5000);
+                                     h.snapshot().hedgeQuotes.sell.reason.contains("tight"),
+                                 5000);
         QVERIFY(h.snapshot().running);
-        QMetaObject::invokeMethod(h.server, [&] { h.server->spreadExtra = 0; }, Qt::BlockingQueuedConnection);
-        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().hedgeQuotes.buy.enabled && h.snapshot().hedgeQuotes.sell.enabled, 5000);
+        QMetaObject::invokeMethod(
+            h.server, [&] { h.server->spreadExtra = 0; }, Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            h.snapshot().hedgeQuotes.buy.enabled && h.snapshot().hedgeQuotes.sell.enabled, 5000);
     }
 
     void transientExchangeRejectionsRetryWithoutDuplicate_data()
@@ -2212,7 +2489,7 @@ class RuntimeTests : public QObject
         const auto id = h.snapshot().profileId;
         QMetaObject::invokeMethod(
             h.server, [&] { h.server->position -= .002; }, Qt::BlockingQueuedConnection);
-        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().problem.contains("Position reconciliation stopped"),
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().problem.contains("Position reconciliation pending"),
                                  15000);
         QVERIFY(!h.snapshot().running && !h.snapshot().synced);
         QCOMPARE(h.snapshot().profileId, id);
@@ -2222,6 +2499,11 @@ class RuntimeTests : public QObject
         Store core(path);
         QVERIFY(!core.metadata("pnl_start/" + h.snapshot().constructionId).isEmpty());
         QCOMPARE(core.coveredQuantity(h.snapshot().orders.first().id), .01);
+        QMetaObject::invokeMethod(
+            h.server, [&] { h.server->position = -.01; }, Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced && h.snapshot().running && !h.snapshot().busy,
+                                 15000);
+        QCOMPARE(h.filledCount(), 1);
     }
     void partialFillsDuplicatesAndStaleUpdates()
     {
@@ -2280,7 +2562,6 @@ class RuntimeTests : public QObject
         QVERIFY(h.snapshot().messages.join(" ").contains("Post-only edit rejected"));
     }
 
-
     void singleReversalOrderAccountsPartialFills()
     {
         QTemporaryDir d;
@@ -2296,19 +2577,28 @@ class RuntimeTests : public QObject
         QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().synced, 15000);
         h.start();
         QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() == 1, 5000);
-        QMetaObject::invokeMethod(h.server, [&] {
-            const auto label = h.server->byLabel.begin().key();
-            QCOMPARE(h.server->lastSubmitted["amount"].toDouble(), .02);
-            QCOMPARE(h.server->lastMarginAmount, .02);
-            QVERIFY(!h.server->lastSubmitted["reduce_only"].toBool());
-            h.server->fillOrder(label, .004);
-        }, Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(
+            h.server,
+            [&]
+            {
+                const auto label = h.server->byLabel.begin().key();
+                QCOMPARE(h.server->lastSubmitted["amount"].toDouble(), .02);
+                QCOMPARE(h.server->lastMarginAmount, .02);
+                QVERIFY(!h.server->lastSubmitted["reduce_only"].toBool());
+                h.server->fillOrder(label, .004);
+            },
+            Qt::BlockingQueuedConnection);
         QTRY_VERIFY(std::abs(h.snapshot().inventory - .006) < Epsilon);
-        QMetaObject::invokeMethod(h.server, [&] {
-            const auto label = h.server->byLabel.begin().key();
-            h.server->fillOrder(label, .016);
-        }, Qt::BlockingQueuedConnection);
-        QTRY_VERIFY_WITH_TIMEOUT(h.snapshot().anchored && std::abs(h.snapshot().inventory + .01) < Epsilon, 5000);
+        QMetaObject::invokeMethod(
+            h.server,
+            [&]
+            {
+                const auto label = h.server->byLabel.begin().key();
+                h.server->fillOrder(label, .016);
+            },
+            Qt::BlockingQueuedConnection);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            h.snapshot().anchored && std::abs(h.snapshot().inventory + .01) < Epsilon, 5000);
         QVERIFY(h.snapshot().running);
     }
     void postOnlyNeverCrossesAndEditIncludesPartialFill()
@@ -2322,11 +2612,7 @@ class RuntimeTests : public QObject
         h.start();
         QTRY_VERIFY_WITH_TIMEOUT(h.server->mutations.load() >= 1, 10000);
         QMetaObject::invokeMethod(
-            h.server,
-            [&]
-            {
-                h.server->fillOrder(h.server->byLabel.begin().key(), .004);
-            },
+            h.server, [&] { h.server->fillOrder(h.server->byLabel.begin().key(), .004); },
             Qt::BlockingQueuedConnection);
         QMetaObject::invokeMethod(
             h.server, [&] { h.server->quoteShift = -5; }, Qt::BlockingQueuedConnection);

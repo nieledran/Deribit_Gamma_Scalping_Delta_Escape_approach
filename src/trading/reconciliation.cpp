@@ -9,6 +9,7 @@ void TradingWorker::requestRecovery(const QString& reason)
     if (recovering)
         return;
     recoveryChecks = 0;
+    recoveryRetryMs = Time::FillRecoveryDelayMs;
     recoveryReadyAt = 0;
     recovering = true;
     synced = false;
@@ -16,6 +17,20 @@ void TradingWorker::requestRecovery(const QString& reason)
     desiredClose = false;
     status = "Reconciling execution";
     log(reason, {{"exchange_position", actualPosition}, {"expected_position", expectedPosition()}});
+    save();
+    publish();
+}
+void TradingWorker::deferRecovery(const QString& reason)
+{
+    if (!recovering)
+        requestRecovery(reason);
+    busy = syncing = false;
+    engine.stop(reason);
+    status = requested == RunRequest::None ? "Waiting for reconciliation"
+                                           : "Reconciling; auto-resume pending";
+    recoveryReadyAt = utcNow() + recoveryRetryMs;
+    recoveryRetryMs = std::min(Exchange::MaxRetryMs, recoveryRetryMs * 2);
+    log(reason + "; retrying reconciliation automatically", {}, true, "execution_recovery");
     save();
     publish();
 }
@@ -60,21 +75,32 @@ void TradingWorker::recoverPosition()
                                 recoveryReadyAt = utcNow() + Time::FillRecoveryDelayMs;
                                 return;
                             }
-                            if (!matching || foreignOrders || selectionReview)
+                            if (foreignOrders || selectionReview)
                             {
-                                fail(QString("Position reconciliation stopped: exchange %1, "
-                                             "expected %2 %3; "
-                                             "difference %4 after %5 checks. Profile and history "
-                                             "retained; verify the exchange position and trade "
-                                             "history, then reconnect.")
-                                         .arg(actualPosition, 0, 'g', 12)
-                                         .arg(expectedPosition(), 0, 'g', 12)
-                                         .arg(engine.config.base())
-                                         .arg(actualPosition - expectedPosition(), 0, 'g', 12)
-                                         .arg(recoveryChecks));
+                                fail("Order ownership or option selection requires review");
+                                return;
+                            }
+                            if (!matching)
+                            {
+                                const QString reason =
+                                    QString("Position reconciliation %1: exchange %2, "
+                                            "expected %3 %4; "
+                                            "difference %5 after %6 checks. Profile and history "
+                                            "retained")
+                                        .arg(requested == RunRequest::None ? "stopped" : "pending")
+                                        .arg(actualPosition, 0, 'g', 12)
+                                        .arg(expectedPosition(), 0, 'g', 12)
+                                        .arg(engine.config.base())
+                                        .arg(actualPosition - expectedPosition(), 0, 'g', 12)
+                                        .arg(recoveryChecks);
+                                if (requested == RunRequest::None)
+                                    fail(reason);
+                                else
+                                    deferRecovery(reason);
                                 return;
                             }
                             recovering = false;
+                            recoveryRetryMs = Time::FillRecoveryDelayMs;
                             synced = true;
                             engine.active = false;
                             attempts = 0;
@@ -124,9 +150,6 @@ void TradingWorker::reconcile()
                                     loadPositions(
                                         [this, before]
                                         {
-                                            emit historyConnect(clientId, clientSecret,
-                                                                engine.config.production, account,
-                                                                endpoint);
                                             if (before != positionRevision ||
                                                 std::abs(actualPosition - expectedPosition()) >
                                                     engine.spec.step * .1)
@@ -391,8 +414,9 @@ void TradingWorker::recoverTrades(int index, std::function<void()> done, bool hi
                             recoverTrades(index, std::move(done), true);
                             return;
                         }
-                        throw std::runtime_error("Historical fill coverage does not match "
-                                                 "cumulative execution; trading remains blocked");
+                        deferRecovery(
+                            "Waiting for confirmed fill details to match cumulative execution");
+                        return;
                     }
                     recoverTrades(index + 1, std::move(done));
                 });

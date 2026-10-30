@@ -123,8 +123,7 @@ void TradingWorker::completeStart()
             validateStart();
             if (!engine.start(utcNow()))
                 throw std::runtime_error(engine.problem.toStdString());
-            const QString key = "pnl_start/" + construction;
-            if (store->metadata(key).isEmpty())
+            if (!pendingPnlStarts.contains(construction))
             {
                 publish();
                 TradingSnapshot snapshot;
@@ -132,9 +131,9 @@ void TradingWorker::completeStart()
                     std::lock_guard<std::mutex> lock(shared->mutex);
                     snapshot = shared->trading;
                 }
-                // Commit before pump can submit the first order, independently of analytics/UI.
-                store->metadata(key, Ledger::valuationSnapshot(snapshot));
-                log("Construction P&L started", {{"at", snapshot.timestamp}});
+                // Preserve the first Start snapshot even if report storage is temporarily busy.
+                pendingPnlStarts.insert(construction, Ledger::valuationSnapshot(snapshot));
+                flushPnlStart();
             }
             engine.problem.clear();
             requested = RunRequest::Hedge;

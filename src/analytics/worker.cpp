@@ -9,7 +9,7 @@ AnalyticsWorker::AnalyticsWorker(QString p, std::shared_ptr<SharedState> s)
     : corePath(std::move(p)), shared(std::move(s))
 {
 }
-void AnalyticsWorker::guard(const std::function<void()>& f)
+void AnalyticsWorker::guard(const std::function<void()>& f, bool historyOperation)
 {
     try
     {
@@ -18,6 +18,9 @@ void AnalyticsWorker::guard(const std::function<void()>& f)
     catch (const std::exception& e)
     {
         error = QString::fromUtf8(e.what());
+        emit reportIssue(error);
+        if (historyOperation && !historyBlocked)
+            retryHistory(error);
         std::lock_guard<std::mutex> lock(shared->mutex);
         shared->analytics.message = "Analytics error: " + error;
     }
@@ -35,16 +38,18 @@ void AnalyticsWorker::initialize()
     timer->start();
     historyTimer = new QTimer(this);
     historyTimer->setInterval(History::RequestIntervalMs);
-    connect(historyTimer, &QTimer::timeout, this, [this] { guard([&] { nextImport(); }); });
+    connect(historyTimer, &QTimer::timeout, this, [this] { guard([&] { nextImport(); }, true); });
     historyTimer->start();
     history = new Client(this);
     connect(history, &Client::authenticatedSession, this,
-            [this] { guard([&] { authenticateHistory(); }); });
+            [this] { guard([&] { authenticateHistory(); }, true); });
     connect(history, &Client::lost, this,
             [this]
             {
+                ++epoch; // Ignore replies from the lost session, including pending imports.
                 ready = false;
                 busy = false;
+                verifying = false;
                 historyStatus =
                     "History disconnected; queued imports will resume after authentication";
             });
@@ -86,8 +91,6 @@ void AnalyticsWorker::update()
     a.historyStatus = historyStatus;
     if (!coherent)
         a.completeness = "Market data stale; last available valuation. " + a.completeness;
-    if (!error.isEmpty())
-        a.message = "Analytics error: " + error;
     if (coherent)
     {
         Valuation valuation;
@@ -96,10 +99,11 @@ void AnalyticsWorker::update()
         ledger->sample(s, valuation, &a);
     }
     a.calculationUs = elapsed.nsecsElapsed() / 1000;
+    error.clear();
     {
         std::lock_guard<std::mutex> lock(shared->mutex);
         QString message = shared->analytics.message;
-        if (!message.isEmpty() && a.message.isEmpty())
+        if (!message.startsWith("Analytics error:") && !message.isEmpty() && a.message.isEmpty())
             a.message = message;
         shared->analytics = std::move(a);
     }
@@ -153,8 +157,10 @@ void AnalyticsWorker::requestRisk(RiskRequest request)
         result.deltaChange = s.config.deltaChange;
         for (const auto& option : selected)
             result.impliedVols.append({option.spec.name, option.iv});
-        result.lower = s.hedgeQuotes.buy.enabled ? std::optional<double>(s.hedgeQuotes.buy.price) : std::nullopt;
-        result.upper = s.hedgeQuotes.sell.enabled ? std::optional<double>(s.hedgeQuotes.sell.price) : std::nullopt;
+        result.lower = s.hedgeQuotes.buy.enabled ? std::optional<double>(s.hedgeQuotes.buy.price)
+                                                 : std::nullopt;
+        result.upper = s.hedgeQuotes.sell.enabled ? std::optional<double>(s.hedgeQuotes.sell.price)
+                                                  : std::nullopt;
         for (const auto& order : s.orders)
             if (!order.terminal && !order.uncertain)
             {

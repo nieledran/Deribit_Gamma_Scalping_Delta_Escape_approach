@@ -107,10 +107,17 @@ void TradingWorker::loadPositions(std::function<void()> done, bool reconcileRead
                                                     else if (j["direction"] == "buy")
                                                         actualPosition = std::abs(actualPosition);
                                                     positionAt = utcNow();
-                                                    if (std::abs(actualPosition -
+                                                    if (utcNow() -
+                                                                loggedAt.value(
+                                                                    "position_mismatch_snapshot") >=
+                                                            Time::MinuteMs &&
+                                                        std::abs(actualPosition -
                                                                  expectedPosition()) >
-                                                        engine.spec.step * .1)
-                                                        store->event(
+                                                            engine.spec.step * .1)
+                                                    {
+                                                        loggedAt["position_mismatch_snapshot"] =
+                                                            utcNow();
+                                                        recordEvent(
                                                             "position_mismatch_snapshot",
                                                             {{"position", j},
                                                              {"expected_position",
@@ -118,6 +125,7 @@ void TradingWorker::loadPositions(std::function<void()> done, bool reconcileRead
                                                              {"inventory", engine.inventory},
                                                              {"external_position",
                                                               externalPosition}});
+                                                    }
                                                     liquidation =
                                                         j["estimated_liquidation_price"].toDouble();
                                                     fundingValid = j["realized_funding"].isDouble();

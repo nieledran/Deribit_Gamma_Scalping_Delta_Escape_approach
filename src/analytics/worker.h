@@ -22,6 +22,7 @@ class AnalyticsWorker : public QObject
     void shutdown();
   signals:
     void stopped();
+    void reportIssue(QString message);
 
   private:
     enum class ImportKind
@@ -45,11 +46,14 @@ class AnalyticsWorker : public QObject
     QTimer *timer = nullptr, *historyTimer = nullptr;
     QQueue<Import> imports;
     QSet<QString> scheduled;
-    bool busy = false, ready = false;
+    bool busy = false, ready = false, verifying = false, historyBlocked = false;
     int epoch = 0;
     quint64 revision = 0;
     qint64 lastFundingRefresh = 0;
-    void guard(const std::function<void()>& operation);
+    qint64 historyRetryAt = 0;
+    int historyRetryMs = Time::SecondMs;
+    void retryHistory(const QString& reason);
+    void guard(const std::function<void()>& operation, bool historyOperation = false);
     TradingSnapshot snapshot() const;
     bool coherentSnapshot(const TradingSnapshot& snapshot) const;
     void update();

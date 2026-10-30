@@ -109,13 +109,109 @@ void TradingWorker::initialize()
             emit initialized();
         });
 }
-void TradingWorker::log(const QString& text, const QJsonObject& details)
+void TradingWorker::journalMessage(const QString& text, bool important)
 {
-    messages.append(isoUtc(utcNow()) + "  " + text);
+    messages.append({isoUtc(utcNow()) + "  " + text, important});
     while (messages.size() > Limits::JournalMessages)
-        messages.removeFirst();
-    if (store && !storageFailed)
-        store->event(text, details);
+    {
+        // Routine messages cannot evict the most recent 100 warnings/errors.
+        const auto regular = std::find_if(messages.begin(), messages.end(),
+                                          [](const auto& item) { return !item.important; });
+        const auto count = std::count_if(messages.begin(), messages.end(),
+                                         [](const auto& item) { return item.important; });
+        if (regular != messages.end() && count <= Limits::JournalMessages / 2)
+            messages.erase(regular);
+        else
+            messages.removeFirst();
+    }
+}
+void TradingWorker::log(const QString& text, const QJsonObject& details, bool important,
+                        const QString& category)
+{
+    const auto now = utcNow();
+    if (!category.isEmpty())
+    {
+        if (loggedAt.contains(category) && now - loggedAt.value(category) < Time::MinuteMs)
+            return;
+        loggedAt[category] = now;
+    }
+    journalMessage(text, important);
+    auto data = details;
+    data["severity"] = important ? "warning" : "info";
+    recordEvent(text, data);
+}
+void TradingWorker::recordEvent(const QString& kind, const QJsonObject& details)
+{
+    if (!store)
+        return;
+    auto data = details;
+    data["recorded_at"] = utcNow();
+    // This diagnostic queue is independent of durable orders and fills.
+    if (pendingEvents.size() >= 1024)
+    {
+        const auto routine =
+            std::find_if(pendingEvents.begin(), pendingEvents.end(),
+                         [](const auto& event) { return event.second["severity"] == "info"; });
+        if (routine != pendingEvents.end())
+            pendingEvents.erase(routine);
+        else
+            pendingEvents.removeFirst();
+    }
+    pendingEvents.append({kind, data});
+    flushJournal();
+}
+void TradingWorker::reportIssue(QString message)
+{
+    log("P&L warning: " + message, {}, true, "pnl_warning/" + message);
+}
+void TradingWorker::flushJournal()
+{
+    if (!store || pendingEvents.isEmpty() || utcNow() < journalRetryAt)
+        return;
+    try
+    {
+        while (!pendingEvents.isEmpty())
+        {
+            const auto& event = pendingEvents.first();
+            store->event(event.first, event.second, event.second["recorded_at"].toInteger());
+            pendingEvents.removeFirst();
+        }
+        if (journalRetryAt)
+            journalMessage("Journal storage restored; retained events saved", true);
+        journalRetryAt = 0;
+    }
+    catch (const std::exception& e)
+    {
+        if (!journalRetryAt)
+            journalMessage("Journal write delayed; trading continues, retrying automatically: " +
+                               QString::fromUtf8(e.what()),
+                           true);
+        journalRetryAt = utcNow() + Time::SecondMs;
+    }
+}
+void TradingWorker::flushPnlStart()
+{
+    if (!store || pendingPnlStarts.isEmpty() || utcNow() < pnlRetryAt)
+        return;
+    try
+    {
+        while (!pendingPnlStarts.isEmpty())
+        {
+            auto pending = pendingPnlStarts.begin();
+            const QString key = "pnl_start/" + pending.key();
+            if (store->metadata(key).isEmpty())
+                store->metadata(key, pending.value());
+            pendingPnlStarts.erase(pending);
+        }
+        pnlRetryAt = 0;
+    }
+    catch (const std::exception& e)
+    {
+        pnlRetryAt = utcNow() + Time::SecondMs;
+        log("P&L start recording delayed; trading continues, retrying automatically: " +
+                QString::fromUtf8(e.what()),
+            {}, true, "pnl_start_retry");
+    }
 }
 void TradingWorker::fail(const QString& reason)
 {
@@ -135,14 +231,12 @@ void TradingWorker::fail(const QString& reason)
     syncing = false;
     engine.stop(reason);
     status = "Stopped";
-    messages.append(isoUtc(utcNow()) + "  ERROR: " + reason);
-    while (messages.size() > Limits::JournalMessages)
-        messages.removeFirst();
+    journalMessage("ERROR: " + reason, true);
+    recordEvent("error", {{"message", reason}, {"severity", "error"}});
     // Cancellation remains available even when durability has failed. New orders do not.
     if (store && !storageFailed)
         try
         {
-            store->event("error", {{"message", reason}});
             store->save(engine, orders);
         }
         catch (...)
@@ -204,7 +298,8 @@ void TradingWorker::publish()
     s.quote = engine.quote;
     s.margin = engine.margin;
     s.orders = orders;
-    s.messages = messages;
+    for (const auto& message : messages)
+        s.messages.append(message.text);
     s.liquidation = liquidation;
     s.makerFee = accountMakerFee.value_or(engine.config.fallbackMakerFee);
     s.takerFee = accountTakerFee.value_or(engine.config.fallbackTakerFee);
@@ -243,6 +338,8 @@ void TradingWorker::publish()
 void TradingWorker::shutdown()
 {
     shuttingDown = true;
+    flushPnlStart();
+    flushJournal();
     if (pumpTimer)
         pumpTimer->stop();
     if (publishTimer)

@@ -89,12 +89,7 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
     else
         save();
     busy = true;
-    if (!storageFailed)
-        store->event("order_intent", {{"method", method},
-                                      {"params", params},
-                                      {"label", order.label},
-                                      {"target", order.target},
-                                      {"option_delta", aggregate(engine.options).delta}});
+    // The intent is already durable in orders. Do not duplicate every edit in events.
     QString label = order.label;
     const quint64 intentRevision = positionRevision;
     int generation = epoch;
@@ -114,26 +109,31 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
                         return;
                     if (!r.ok)
                     {
-                        log(QString("%1 failed: code %2, %3 (order %4); amount %5, step %6, "
-                                    "position %7, target %8")
-                                .arg(method)
-                                .arg(r.code)
-                                .arg(r.error, label)
-                                .arg(o->request.contains("amount")
-                                         ? QString::number(o->request["amount"].toDouble(), 'g', 12)
-                                         : "n/a")
-                                .arg(engine.spec.step, 0, 'g', 12)
-                                .arg(engine.inventory, 0, 'g', 12)
-                                .arg(o->target, 0, 'g', 12),
-                            {{"method", method},
-                             {"code", r.code},
-                             {"reason", r.error},
-                             {"label", label},
-                             {"request", o->request},
-                             {"step", engine.spec.step},
-                             {"inventory", engine.inventory},
-                             {"target", o->target},
-                             {"uncertain", r.uncertain}});
+                        if (r.error == "Request cancelled before send")
+                            ++skippedRequests;
+                        else
+                            log(QString("%1 failed: code %2, %3 (order %4); amount %5, step %6, "
+                                        "position %7, target %8")
+                                    .arg(method)
+                                    .arg(r.code)
+                                    .arg(r.error, label)
+                                    .arg(o->request.contains("amount")
+                                             ? QString::number(o->request["amount"].toDouble(), 'g',
+                                                               12)
+                                             : "n/a")
+                                    .arg(engine.spec.step, 0, 'g', 12)
+                                    .arg(engine.inventory, 0, 'g', 12)
+                                    .arg(o->target, 0, 'g', 12),
+                                {{"method", method},
+                                 {"code", r.code},
+                                 {"reason", r.error},
+                                 {"label", label},
+                                 {"request", o->request},
+                                 {"step", engine.spec.step},
+                                 {"inventory", engine.inventory},
+                                 {"target", o->target},
+                                 {"uncertain", r.uncertain}},
+                                true, method + "/" + QString::number(r.code));
                         if (r.uncertain)
                         {
                             o->uncertain = true;
@@ -151,7 +151,8 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
                         }
                         save();
                         if (r.code == 11044 || r.code == 11008 || r.code == 10010 ||
-                            r.code == 10004)
+                            r.code == 10004 ||
+                            (r.code == 11030 && r.error.contains("order_not_found")))
                         {
                             o->uncertain = true;
                             save();
@@ -173,7 +174,6 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
                         }
                         if (r.error == "Request cancelled before send")
                         {
-                            log("Queued request cancelled before send");
                             return;
                         }
                         if (r.retryable())
@@ -197,7 +197,6 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
                     }
                     receiveOrder(j, true);
                     receiveTrades(root["trades"].toArray());
-
                 });
         },
         true, true,
@@ -215,11 +214,16 @@ void TradingWorker::execute(QString method, QJsonObject params, Order& order)
                 engine.inventory +
                 (o->buy ? 1 : -1) * std::max(0.0, params["amount"].toDouble() - o->filled);
             if (reducing && (engine.inventory * (o->buy ? 1 : -1) >= 0 ||
-                                  std::abs(final) > std::abs(engine.inventory) + Epsilon ||
-                                  final * engine.inventory < -Epsilon))
+                             std::abs(final) > std::abs(engine.inventory) + Epsilon ||
+                             final * engine.inventory < -Epsilon))
                 return false;
-            const HedgeQuote intent{o->role, {}, o->buy, true, params["price"].toDouble(),
-                                    std::max(0.0, params["amount"].toDouble() - o->filled), o->target};
+            const HedgeQuote intent{o->role,
+                                    {},
+                                    o->buy,
+                                    true,
+                                    params["price"].toDouble(),
+                                    std::max(0.0, params["amount"].toDouble() - o->filled),
+                                    o->target};
             if (!quoteCurrent(intent, intentRevision))
                 return false;
             return true;
@@ -235,7 +239,8 @@ bool TradingWorker::quoteCurrent(const HedgeQuote& desired, quint64 fillRevision
     const auto& next = desired.buy ? engine.quotes.buy : engine.quotes.sell;
     return next.enabled && next.role == desired.role &&
            std::abs(next.amount - desired.amount) < engine.spec.step * .1 &&
-           std::abs(next.price - desired.price) < engine.spec.tickAt(desired.price) * Limits::QuoteDeadbandTicks &&
+           std::abs(next.price - desired.price) <
+               engine.spec.tickAt(desired.price) * Limits::QuoteDeadbandTicks &&
            (desired.buy ? desired.price < engine.quote.ask : desired.price > engine.quote.bid);
 }
 void TradingWorker::submitNew(const HedgeQuote& desired)
@@ -269,11 +274,18 @@ void TradingWorker::submitNew(const HedgeQuote& desired)
             o.attemptAt = o.createdAt = utcNow();
             orders.append(o);
             execute(o.buy ? "private/buy" : "private/sell",
-                    {{"instrument_name", o.instrument}, {"amount", o.total}, {"price", o.price},
-                     {"type", "limit"}, {"time_in_force", "good_til_cancelled"},
-                     {"post_only", true}, {"reject_post_only", true},
-                     {"reduce_only", reducing}, {"label", o.label}}, orders.last());
-        }, desired.amount, desired.price, desired.buy, reducing);
+                    {{"instrument_name", o.instrument},
+                     {"amount", o.total},
+                     {"price", o.price},
+                     {"type", "limit"},
+                     {"time_in_force", "good_til_cancelled"},
+                     {"post_only", true},
+                     {"reject_post_only", true},
+                     {"reduce_only", reducing},
+                     {"label", o.label}},
+                    orders.last());
+        },
+        desired.amount, desired.price, desired.buy, reducing);
 }
 void TradingWorker::editOrder(Order& order, const HedgeQuote& desired)
 {
@@ -282,17 +294,24 @@ void TradingWorker::editOrder(Order& order, const HedgeQuote& desired)
                           desired.amount <= std::abs(engine.inventory) + Epsilon;
     const QString label = order.label;
     const quint64 fillRevision = positionRevision;
-    preflight([this, label, desired, reducing, fillRevision, total]
-    {
-        auto* o = findOrder(label);
-        if (!o || o->terminal || !o->mutation.isEmpty() || !quoteCurrent(desired, fillRevision))
-            return;
-        o->target = desired.target;
-        o->attemptAt = utcNow();
-        execute("private/edit", {{"order_id", o->id}, {"amount", total}, {"price", desired.price},
-                                 {"post_only", true}, {"reject_post_only", true},
-                                 {"reduce_only", reducing}}, *o);
-    }, desired.amount, desired.price, desired.buy, reducing);
+    preflight(
+        [this, label, desired, reducing, fillRevision, total]
+        {
+            auto* o = findOrder(label);
+            if (!o || o->terminal || !o->mutation.isEmpty() || !quoteCurrent(desired, fillRevision))
+                return;
+            o->target = desired.target;
+            o->attemptAt = utcNow();
+            execute("private/edit",
+                    {{"order_id", o->id},
+                     {"amount", total},
+                     {"price", desired.price},
+                     {"post_only", true},
+                     {"reject_post_only", true},
+                     {"reduce_only", reducing}},
+                    *o);
+        },
+        desired.amount, desired.price, desired.buy, reducing);
 }
 void TradingWorker::cancelOrder(Order& o)
 {

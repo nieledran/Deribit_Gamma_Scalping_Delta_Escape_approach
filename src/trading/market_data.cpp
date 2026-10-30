@@ -29,7 +29,8 @@ void TradingWorker::waitForData(const QString& reason)
             {{"quote_at", engine.quote.at},
              {"bid", engine.quote.bid},
              {"ask", engine.quote.ask},
-             {"exchange_clock_offset_ms", exchangeClockOffsetMs.value_or(0)}});
+             {"exchange_clock_offset_ms", exchangeClockOffsetMs.value_or(0)}},
+            true, "data_pause");
     }
     save();
     publish();
@@ -80,7 +81,8 @@ bool TradingWorker::resumeRequested()
     attempts = 0;
     save();
     log(requested == RunRequest::None ? "Data restored; trading remains paused"
-                                      : "Data and account verified; trading resumed automatically");
+                                      : "Data and account verified; trading resumed automatically",
+        {}, false, "data_resume");
     publish();
     return engine.running;
 }

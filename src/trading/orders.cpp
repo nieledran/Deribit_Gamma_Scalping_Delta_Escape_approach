@@ -60,7 +60,6 @@ void TradingWorker::receiveOrder(const QJsonObject& j, bool response)
         std::abs(filled / engine.spec.step - std::round(filled / engine.spec.step)) > 1e-5)
         throw std::runtime_error("Invalid cumulative fill quantity");
     double change = filled - o->filled;
-    const bool changedState = o->id.isEmpty() || o->state != state;
     engine.inventory += change * (o->buy ? 1 : -1);
     if (std::abs(engine.inventory) < Epsilon)
         engine.inventory = 0;
@@ -85,9 +84,8 @@ void TradingWorker::receiveOrder(const QJsonObject& j, bool response)
         o->request = {};
     }
     save();
-    if (!storageFailed)
-        store->event("order_update", j);
-    if (change > Epsilon || changedState)
+    // Orders and fills retain the recovery/accounting data. Journal actual fills and rejections.
+    if (change > Epsilon || state == "rejected")
         log(QString("%1 %2: %3; filled %4 / %5, remaining %6 %7 at limit %8; average fill %9")
                 .arg(o->buy ? "BUY" : "SELL", id, state)
                 .arg(filled, 0, 'g', 10)
@@ -98,7 +96,7 @@ void TradingWorker::receiveOrder(const QJsonObject& j, bool response)
                 .arg(j["average_price"].toDouble() > 0
                          ? QString::number(j["average_price"].toDouble(), 'g', 12)
                          : QString("unavailable")),
-            j);
+            j, state == "rejected");
 }
 void TradingWorker::receiveTrades(const QJsonArray& trades)
 {

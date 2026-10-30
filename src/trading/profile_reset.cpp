@@ -200,6 +200,10 @@ void TradingWorker::finishProfileReset()
                     ++positionRevision;
                     orders.clear();
                     messages.clear();
+                    pendingEvents.clear();
+                    pendingPnlStarts.clear();
+                    loggedAt.clear();
+                    journalRetryAt = pnlRetryAt = 0;
                     selectionReview = false;
                     fundingValid = false;
                     sessionFunding = fundingBaseline = 0;
